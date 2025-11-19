@@ -264,6 +264,22 @@ def test_feedback_only_loops(feedback_only_adj):
     assert 4 not in counts
 
 
+def test_self_loops_counted_as_feedback():
+    adj = np.array(
+        [
+            [0.5, 0.0],
+            [0.0, -1.0],
+        ],
+        dtype=float,
+    )
+    loops, counts = ms.count_feedback_loops(adj, max_size=1)
+    assert 1 in counts
+    assert counts[1]["Reinforcing Feedback"] == 1
+    assert counts[1]["Balancing Feedback"] == 1
+    assert loops[1]["Reinforcing Feedback"] == [[0]]
+    assert loops[1]["Balancing Feedback"] == [[1]]
+
+
 def test_no_motif_matrix(no_motif_adj):
     _, ffl_counts = ms.count_ffl_types(no_motif_adj)
     assert sum(ffl_counts.values()) == 0

@@ -160,6 +160,20 @@ def classify_feedback_loop(graph, loop_nodes):
         "Neutral or Undefined" if the product is zero,
         "Invalid" if loop is incomplete.
     """
+    # Handle self-loops explicitly (size 1 cycles)
+    if len(loop_nodes) == 1:
+        node = loop_nodes[0]
+        eid = graph.get_eid(node, node, directed=True, error=False)
+        if eid == -1:
+            return "Invalid"
+        weight = graph.es[eid]["weight"]
+        if weight > 0:
+            return "Reinforcing Feedback"
+        elif weight < 0:
+            return "Balancing Feedback"
+        else:
+            return "Neutral or Undefined"
+
     signs = []
     for i in range(len(loop_nodes)):
         src = loop_nodes[i]
@@ -212,12 +226,22 @@ def count_feedback_loops(adj_matrix, max_size=4):
     g = ig.Graph.Weighted_Adjacency(adj_matrix.tolist(), mode='directed')
     g.vs["name"] = node_names
 
-    # Step 2: Find all simple cycles up to max_size
+    # Step 2: Find all simple cycles up to max_size (size >= 2)
     all_cycles = g.simple_cycles(min=2, max=max_size, output='vpath')
 
-    # Step 3: Group results
+    # Step 3: Group results, starting with explicit self-loops (size 1)
     loops_by_size = {}
     counts = {}
+
+    if max_size >= 1:
+        for idx in node_names:
+            weight = adj_matrix[idx, idx]
+            if weight == 0:
+                continue
+            loop_type = "Reinforcing Feedback" if weight > 0 else "Balancing Feedback"
+            loops_by_size.setdefault(1, {})
+            loops_by_size[1].setdefault(loop_type, [])
+            loops_by_size[1][loop_type].append([idx])
 
     for cycle in all_cycles:
         loop_size = len(cycle)

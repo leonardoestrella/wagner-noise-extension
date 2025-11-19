@@ -18,7 +18,8 @@ export
     compute_path_stats,
     compute_alignment_stats,
     # Population analysis functions
-    compute_mut_robustness
+    compute_mut_robustness,
+    compute_population_mut_robustness
     # Future features
     # compute_network_motifs  # TODO: Implement motif analysis
 
@@ -27,6 +28,10 @@ const SimulationMatrix = Matrix{Float64}
 const GenerationSummary = NamedTuple{
     (:mean, :p5, :p25, :p50, :p75, :p95, :validity_pct),
     Tuple{Float64, Float64, Float64, Float64, Float64, Float64, Float64}
+}
+const MutationalRobustnessSummary = NamedTuple{
+    (:mean_expression_shift, :mean_unstable_shift),
+    Tuple{Float64, Float64}
 }
 
     """
@@ -125,6 +130,19 @@ const GenerationSummary = NamedTuple{
         
         return [compute_percentile_stats(gen_align) for gen_align in alignments]
     end
+    """
+        compute_alignment_stats(matrices::AbstractArray{Matrix{Float64}}, 
+                            target::Vector) -> Vector{GenerationSummary}
+
+    Compute per-generation alignment score for a population of matrices.
+    """
+    function compute_all_alignments(
+        matrices::AbstractArray{Matrix{Float64}},
+        target::Vector
+    )::Matrix{Float64}
+        return map(M -> compute_alignment_score(M, target), matrices)
+    end
+
 
     """
         summarize_simulation_run(result::Dict) -> Dict
@@ -150,67 +168,203 @@ const GenerationSummary = NamedTuple{
     end
 
     """
+        generate_expression_distribution(matrix::Matrix{Float64}, 
+                            initial_state::Vector{Int},
+                            n_noise_masks::Int,
+                            noise_dist::Distribution,
+                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
+                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
+                            activation=BooleanNetwork.activation)
+
+    Generates a sample from the expression distribution for a given matrix
+    using the noise distribution. 
+
+    Returns a tuple
+    - avg_stable_expression: A vector with the average expression of each gene
+        in the expression distribution
+    - unstable_proportion: The proportion of times the expressed phenotype was unstable
+    """
+
+    function generate_expression_distribution(matrix::Matrix{Float64}, 
+                            initial_state::Vector{Int},
+                            n_noise_masks::Int,
+                            noise_dist::Distribution,
+                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
+                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
+                            activation=BooleanNetwork.activation)
+        N_genes = size(matrix, 1)
+        stable_states = Matrix{Float64}(undef, n_noise_masks, N_genes)
+        stable_count = 0
+        unstable_count = 0
+        buffer_matrix = Matrix{Float64}(undef, N_genes, N_genes)
+
+        for idx in 1:n_noise_masks
+            copyto!(buffer_matrix, matrix)
+            BooleanNetwork.apply_noise!(buffer_matrix, noise_prob, noise_dist)
+
+            final_state, _ = BooleanNetwork.develop(buffer_matrix, initial_state, max_steps, activation)
+            
+            if final_state !== nothing
+                stable_count += 1
+                stable_states[stable_count, :] = final_state
+            else
+                unstable_count += 1
+            end
+        end
+
+        if stable_count == 0
+            avg_stable_expression = zeros(Float64, N_genes)
+        else
+            avg_stable_expression = vec(mean(view(stable_states, 1:stable_count, :); dims=1))
+        end
+
+        return avg_stable_expression, unstable_count / n_noise_masks
+    end
+
+    """
         compute_mut_robustness(matrix::Matrix{Float64}, 
                             initial_state::Vector{Int},
-                            parameters::Dict,
-                            trials::Int=100) -> Float64
+                            n_mutations::Int,
+                            n_noise_masks::Int,
+                            noise_dist::Distribution;
+                            mut_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS.pr,
+                            mr::Float64=BooleanNetwork.STANDARD_PARAMETERS.mr,
+                            ؟r::Float64=BooleanNetwork.STANDARD_PARAMETERS.؟r,
+                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS.noise_prob,
+                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS.max_steps,
+                            activation=BooleanNetwork.activation)::MutationalRobustnessSummary
 
-    Compute mutational robustness score for a single matrix by applying
-    random mutations and checking phenotype preservation.
+    Estimate the mutational robustness of a regulatory matrix by repeatedly
+    mutating its non-zero entries, simulating noisy dynamics, and aggregating
+    how much the stable expression profile and instability probability shift
+    relative to the unmutated baseline.
 
-    Returns fraction of mutations that preserve the original phenotype.
+    Returns a `NamedTuple` with:
+    - `mean_expression_shift`: average absolute difference between the baseline
+      and mutated average stable expression vectors (averaged over mutations).
+    - `mean_unstable_shift`: average absolute difference in the probability of converging to
+      an unstable phenotype after mutation (mutated minus baseline).
     """
-    function compute_mut_robustness(
-        matrix::Matrix{Float64},
+    function compute_mut_robustness(matrix::Matrix{Float64}, 
+                            initial_state::Vector{Int},
+                            n_mutations::Int,
+                            n_noise_masks::Int,
+                            noise_dist::Distribution;
+                            mut_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["pr"],
+                            mr::Float64=BooleanNetwork.STANDARD_PARAMETERS["mr"],
+                            sigma_r::Float64=BooleanNetwork.STANDARD_PARAMETERS["σr"],
+                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
+                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
+                            activation=BooleanNetwork.activation)::MutationalRobustnessSummary
+        if n_mutations <= 0
+            return (mean_expression_shift=0.0, mean_unstable_shift=0.0)
+        end
+
+        mutation_dist = Normal(mr,sigma_r)
+        n_genes = size(matrix, 1)
+        baseline_mean, baseline_unstable_prob = generate_expression_distribution(
+            matrix,
+            initial_state,
+            n_noise_masks,
+            noise_dist,
+            noise_prob,
+            max_steps,
+            activation
+        )
+
+        expression_shifts = Vector{Float64}(undef, n_mutations)
+        unstable_probability_shifts = Vector{Float64}(undef, n_mutations)
+        mutated_matrix = Matrix{Float64}(undef, n_genes, n_genes)
+
+        for mutation_idx in 1:n_mutations
+            copyto!(mutated_matrix, matrix)
+            BooleanNetwork.reg_mutation!(mutated_matrix, mut_prob, mutation_dist)
+
+            mutated_mean, mutated_unstable_prob = generate_expression_distribution(
+                mutated_matrix,
+                initial_state,
+                n_noise_masks,
+                noise_dist,
+                noise_prob,
+                max_steps,
+                activation
+            )
+
+            expression_shifts[mutation_idx] = mean(abs.(mutated_mean .- baseline_mean))
+            unstable_probability_shifts[mutation_idx] = abs(mutated_unstable_prob - baseline_unstable_prob)
+        end
+
+        return (
+            mean_expression_shift=mean(expression_shifts),
+            mean_unstable_shift=mean(unstable_probability_shifts)
+        )
+    end   
+
+    """
+        compute_population_mut_robustness(matrices::AbstractVector{Matrix{Float64}},
+                                        initial_state::Vector{Int},
+                                        n_mutations::Int,
+                                        n_noise_masks::Int,
+                                        noise_dist::Distribution; kwargs...) 
+            -> Vector{MutationalRobustnessSummary}
+
+    Compute mutational robustness summaries for every matrix within a population.
+    Returns a vector with one `MutationalRobustnessSummary` per network in the
+    order provided.
+    """
+    function compute_population_mut_robustness(
+        matrices::AbstractVector{Matrix{Float64}},
         initial_state::Vector{Int},
-        parameters::Dict,
-        trials::Int=100
-    )::Float64
-        # Get original phenotype
-        orig_phen, _ = develop(matrix, initial_state, parameters["max_steps"])
-        if orig_phen === nothing
-            return 0.0
+        n_mutations::Int,
+        n_noise_masks::Int,
+        noise_dist::Distribution;
+        kwargs...
+    )::Vector{MutationalRobustnessSummary}
+        results = Vector{MutationalRobustnessSummary}(undef, length(matrices))
+        for (idx, matrix) in enumerate(matrices)
+            results[idx] = compute_mut_robustness(
+                matrix,
+                initial_state,
+                n_mutations,
+                n_noise_masks,
+                noise_dist;
+                kwargs...
+            )
         end
-        
-        # Cache distribution for mutations
-        d = Normal(parameters["mr"], parameters["σr"])
-        
-        # Find mutable elements
-        nz_inds = findall(!iszero, matrix)
-        if isempty(nz_inds)
-            return 1.0  # Empty matrix is trivially robust
-        end
-        
-        # Try random mutations
-        invariant_count = 0
-        W_test = copy(matrix)
-        
-        for _ in 1:trials
-            idx = rand(nz_inds)
-            old_val = W_test[idx]
-            W_test[idx] = rand(d)
-            
-            phen, _ = develop(W_test, initial_state, parameters["max_steps"])
-            if phen !== nothing && phen == orig_phen
-                invariant_count += 1
-            end
-            
-            W_test[idx] = old_val  # Restore
-        end
-        
-        return invariant_count / trials
+        return results
     end
 
-    # TODO: Network motif analysis
-    # Placeholder for future implementation of network motif detection and analysis
     """
-        compute_network_motifs(matrix::Matrix{Float64}) -> Dict
+        compute_population_mut_robustness(matrices::AbstractArray{Matrix{Float64}}, 
+                                        initial_state::Vector{Int},
+                                        n_mutations::Int,
+                                        n_noise_masks::Int,
+                                        noise_dist::Distribution; kwargs...) 
+            -> Array{MutationalRobustnessSummary}
 
-    [Not yet implemented]
-    Will analyze network structure for common motifs and regulatory patterns.
+    Array-based overload returning results with the same shape as the input
+    matrix collection.
     """
-    function compute_network_motifs(matrix::Matrix{Float64})
-        error("Network motif analysis not yet implemented")
-    end
+    function compute_population_mut_robustness(
+        matrices::AbstractArray{Matrix{Float64}},
+        initial_state::Vector{Int},
+        n_mutations::Int,
+        n_noise_masks::Int,
+        noise_dist::Distribution;
+        kwargs...
+    )::Array{MutationalRobustnessSummary}
+        result = similar(matrices, MutationalRobustnessSummary)
+        for idx in eachindex(matrices)
+            result[idx] = compute_mut_robustness(
+                matrices[idx],
+                initial_state,
+                n_mutations,
+                n_noise_masks,
+                noise_dist;
+                kwargs...
+            )
+        end
+        return result
+    end 
 
 end # module

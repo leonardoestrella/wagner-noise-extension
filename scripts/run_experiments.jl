@@ -76,7 +76,7 @@ function py_int_pyobject_dict(py_dict)::Dict{Int, PyObject}
 end
 
 default(dpi=300, legendfontsize=10, guidefont=font(11), tickfont=font(9), margin=8Plots.mm, grid=false)
-const BONFERRONI_TESTS = 3 # 3 tests!
+const BONFERRONI_TESTS = 2 # 2 tests!
 
 # ------------------------------------------------------------------
 # Experiment 1 helpers
@@ -89,19 +89,19 @@ struct NoiseScenario
 end
 
 Base.@kwdef struct Experiment1Config
-    generations::Int = 500 # 500
-    pop_size::Int = 300 # 300
+    generations::Int = 50 # 500
+    pop_size::Int = 30 # 300
     mode::String = "stable"
-    trials::Int = 30 # 30
+    trials::Int = 3 # 30
     thetas::Vector{Float64} = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
     robustness_n_mutations::Int = 5
-    robustness_n_noise_masks::Int = 5
+    robustness_n_noise_masks::Int = 30
 end
 
 Base.@kwdef struct Experiment2Config
-    trials::Int = 30 # 30
+    trials::Int = 3 # 30
     max_loop_size::Int = 5 # 5
-    sample_size::Int = 30 # 30
+    sample_size::Int = 3 # 30
 end
 
 struct PopulationRobustnessSummary
@@ -200,6 +200,8 @@ function run_experiment1(config::Experiment1Config)
         all_alignment = zeros(config.trials, gens)
 
         @threads for trial_idx in 1:config.trials
+            local_params = deepcopy(params)
+            local_params["noise_dist"] = scenario.distribution
             local_params = deepcopy(params)
             local_params["noise_dist"] = scenario.distribution
 
@@ -390,12 +392,24 @@ function save_mutational_robustness_plots(result::Experiment1Result)
     for idx in eachindex(result.scenarios)
         scenario = result.scenarios[idx]
         label_token = sanitize_filename(scenario.label)
+
+        x_range_scatter = (minimum(expr_init[idx, :]) - 0.5,
+                        maximum(expr_init[idx, :]) + 0.5)
+
+        y_range_scatter = (minimum(expr_final[idx, :]) - 0.5,
+                        maximum(expr_final[idx, :]) + 0.5)
+
+        abs_min = minimum([x_range_scatter[1], y_range_scatter[1]])
+        abs_max = maximum([x_range_scatter[2], y_range_scatter[2]])
+
         expr_plot = mutational_scatter_plot(
             expr_init[idx, :],
             expr_final[idx, :];
             xlabel="Initial mean expression shift",
             ylabel="Final mean expression shift",
-            title="Expression shift"
+            title="Expression shift",
+            xrange = (abs_min, abs_max),
+            yrange = (abs_min, abs_max),
         )
 
         stab_plot = mutational_scatter_plot(
@@ -411,30 +425,43 @@ function save_mutational_robustness_plots(result::Experiment1Result)
     end
 
     theta_vals = [scenario.variance for scenario in result.scenarios]
-    expr_change = [mean(expr_final[idx, :] .- expr_init[idx, :]) for idx in eachindex(result.scenarios)]
-    stab_change = [mean(stab_final[idx, :] .- stab_init[idx, :]) for idx in eachindex(result.scenarios)]
+    expr_change = Float64[]
+    expr_ci = Float64[]
+    stab_change = Float64[]
+    stab_ci = Float64[]
+
+    for idx in eachindex(result.scenarios)
+        expr_delta = expr_final[idx, :] .- expr_init[idx, :]
+        stab_delta = stab_final[idx, :] .- stab_init[idx, :]
+        push!(expr_change, mean(expr_delta))
+        push!(stab_change, mean(stab_delta))
+        push!(expr_ci, 1.96 * std(expr_delta) / sqrt(length(expr_delta)))
+        push!(stab_ci, 1.96 * std(stab_delta) / sqrt(length(stab_delta)))
+    end
 
     expr_vs_theta = scatter(
         sqrt.(theta_vals),
         expr_change;
-        xlabel="Noise variance (√θ)",
+        xlabel="Noise standard deviation (√θ)",
         ylabel="Δ mean expression shift",
-        title="Expression shift change vs √θ",
+        title="Expression shift change vs noise standard deviation √θ",
         legend=false,
         markersize=7,
-        grid=false
+        grid=false,
+        yerror=expr_ci
     )
     savefig(expr_vs_theta, joinpath(ROBUSTNESS_FIG_DIR, "expression_vs_theta.png"))
 
     stab_vs_theta = scatter(
         sqrt.(theta_vals),
         stab_change;
-        xlabel="Noise variance (√θ)",
+        xlabel="Noise standard deviation (√θ)",
         ylabel="Δ mean unstable shift",
-        title="Stability shift change vs √θ",
+        title="Stability shift change vs noise standard deviation √θ",
         legend=false,
         markersize=7,
-        grid=false
+        grid=false,
+        yerror=stab_ci
     )
     savefig(stab_vs_theta, joinpath(ROBUSTNESS_FIG_DIR, "stability_vs_theta.png"))
 end
@@ -511,9 +538,6 @@ function alignment_regression_plot(result::Experiment1Result)
     noisy_sems = vec(std(result.final_alignments[2:end, :], dims=2) ./ sqrt(config.trials))
     x_vals = sqrt.(config.thetas)
 
-    df = DataFrame(Noise=x_vals, Alignment=noisy_means)
-    model = lm(@formula(Alignment ~ Noise), df)
-    y_pred = predict(model)
     ci_95 = noisy_sems .* 1.96
 
     xmin, xmax = extrema(x_vals)
@@ -540,26 +564,16 @@ function alignment_regression_plot(result::Experiment1Result)
         xlims=shared_xlims,
         xformatter=_ -> ""
     )
-    plot!(
-        p_top,
-        x_vals,
-        y_pred;
-        linewidth=3,
-        color=:red,
-        label=@sprintf("Regression (R² = %.3f)", r2(model))
-    )
-
     p_bottom = plot(
-        x_vals,
-        zeros(length(x_vals));
         xlabel=L"Noise Standard Deviation ($\sigma = \sqrt{\theta}$)",
         legend=false,
         ylims=(0, 0.01),
-        yticks=[0],
-        xlims=shared_xlims
+        yticks=[],
+        xlims=shared_xlims,
+        grid=false
     )
 
-    final_plot = plot(p_top, p_bottom; layout=@layout([a{0.85h}; b{0.15h}]))
+    final_plot = plot(p_top, p_bottom; layout=@layout([a{0.88h}; b{0.12h}]), size=(650, 550))
     save_plot(final_plot, "alignment_regression_broken_axis.png")
 end
 
@@ -681,14 +695,10 @@ function aggregate_motif_statistics(generator::Function, config::Experiment2Conf
 end
 
 function create_summary_plots(data_dict::Dict{String, Vector{Float64}},
-        null_expectation::Dict{String, Tuple{Float64, Float64}})
+        null_expectation::Dict{String, Tuple{Float64, Float64}}; title::String="")
     sorted_keys = sort(collect(keys(data_dict)))
     means = [mean(data_dict[k]) for k in sorted_keys]
     ses = [std(data_dict[k]) / sqrt(length(data_dict[k])) for k in sorted_keys]
-    p50_lower = [quantile(data_dict[k], 0.25) for k in sorted_keys]
-    p50_upper = [quantile(data_dict[k], 0.75) for k in sorted_keys]
-    p95_lower = [quantile(data_dict[k], 0.025) for k in sorted_keys]
-    p95_upper = [quantile(data_dict[k], 0.975) for k in sorted_keys]
 
     null_means = [get(null_expectation, k, (0.0, 0.0))[1] for k in sorted_keys]
     null_ses = [get(null_expectation, k, (0.0, 0.0))[2] for k in sorted_keys]
@@ -705,6 +715,7 @@ function create_summary_plots(data_dict::Dict{String, Vector{Float64}},
         xlabel="FFL Type",
         ylabel="Average (%)",
         xrotation=45,
+        title=title,
         legend=:bottomright,
         background_color_legend=:transparent,
         #grid=:y,
@@ -730,85 +741,111 @@ function create_summary_plots(data_dict::Dict{String, Vector{Float64}},
         errorbarcap=:round
     )
 
-    ymax = maximum(p95_upper) * 1.1
-    p_right = plot(
-        xlabel="FFL Type",
-        ylabel="Value",
-        xrotation=45,
-        legend=:outertopright,
-        background_color_legend=:transparent,
-        ylim=(0, ymax),
-        left_margin=12Plots.mm,
-        bottom_margin=12Plots.mm
-    )
-    for (idx, key) in enumerate(sorted_keys)
-        label95 = idx == 1 ? "95% Percentile" : ""
-        label50 = idx == 1 ? "50% Percentile" : ""
-        labelNull = idx == 1 ? "Null ± 2 SE" : ""
-
-        plot!(p_right, [key, key], [p95_lower[idx], p95_upper[idx]]; color=:gray, lw=6, alpha=0.5, label=label95)
-        plot!(p_right, [key, key], [p50_lower[idx], p50_upper[idx]]; color=colors[idx], lw=8, alpha=0.8, label=label50)
-        plot!(p_right, [key, key], [null_means[idx] - 1.96 * null_ses[idx], null_means[idx] + 1.96 * null_ses[idx]];
-            color=:black, lw=2, alpha=0.9, label=labelNull)
-        scatter!(p_right, [key], [null_means[idx]]; color=:black, marker=:x, label="")
-    end
-
-    return plot(p_left, p_right; layout=(1, 2), size=(1100, 500))
+    return p_left
 end
 
-function create_summary_plots_fbcks(expectations_noiseless::Dict{Int, Tuple{Float64, Float64}},
-        expectations_random::Dict{Int, Tuple{Float64, Float64}},
-        loop_type::String;
-        max_size::Int=4,
-        color=:blue)
+function feedback_comparison_panel(
+        primary_reinf::Dict{Int, Tuple{Float64, Float64}},
+        primary_balanc::Dict{Int, Tuple{Float64, Float64}},
+        reference_reinf::Dict{Int, Tuple{Float64, Float64}},
+        reference_balanc::Dict{Int, Tuple{Float64, Float64}};
+        max_size::Int,
+        primary_label::String,
+        reference_label::String,
+        title::String)
+
+    function extract_stats(dict::Dict{Int, Tuple{Float64, Float64}}, sizes)
+        means = [get(dict, s, (0.0, 0.0))[1] for s in sizes]
+        sems = [get(dict, s, (0.0, 0.0))[2] for s in sizes]
+        return means, sems
+    end
+
     sizes = 1:max_size
-    mean_noiseless = [expectations_noiseless[s][1] for s in sizes]
-    sem_noiseless = [expectations_noiseless[s][2] for s in sizes]
-    mean_random = [expectations_random[s][1] for s in sizes]
-    sem_random = [expectations_random[s][2] for s in sizes]
+    primary_reinf_mean, primary_reinf_sem = extract_stats(primary_reinf, sizes)
+    primary_balanc_mean, primary_balanc_sem = extract_stats(primary_balanc, sizes)
+    reference_reinf_mean, reference_reinf_sem = extract_stats(reference_reinf, sizes)
+    reference_balanc_mean, reference_balanc_sem = extract_stats(reference_balanc, sizes)
 
-    lower_bounds = min.(mean_noiseless .- 1.96 .* sem_noiseless, mean_random .- 1.96 .* sem_random)
-    upper_bounds = max.(mean_noiseless .+ 1.96 .* sem_noiseless, mean_random .+ 1.96 .* sem_random)
-    global_min = minimum(lower_bounds)
-    global_max = maximum(upper_bounds)
-    padding = max(0.05, 0.1 * (global_max - global_min))
-    ymin = clamp(global_min - padding, 0.0, 1.0)
-    ymax = clamp(global_max + padding, 0.0, 1.0)
+    lower_bounds = minimum([
+        minimum(primary_reinf_mean .- 1.96 .* primary_reinf_sem),
+        minimum(primary_balanc_mean .- 1.96 .* primary_balanc_sem),
+        minimum(reference_reinf_mean .- 1.96 .* reference_reinf_sem),
+        minimum(reference_balanc_mean .- 1.96 .* reference_balanc_sem)
+    ])
 
-    plt = plot(
+    upper_bounds = maximum([
+        maximum(primary_reinf_mean .+ 1.96 .* primary_reinf_sem),
+        maximum(primary_balanc_mean .+ 1.96 .* primary_balanc_sem),
+        maximum(reference_reinf_mean .+ 1.96 .* reference_reinf_sem),
+        maximum(reference_balanc_mean .+ 1.96 .* reference_balanc_sem)
+    ])
+
+    padding = max(0.05, 0.1 * (upper_bounds - lower_bounds))
+    ymin = clamp(lower_bounds - padding, 0.0, 1.0)
+    ymax = clamp(upper_bounds + padding, 0.0, 1.0)
+
+    plt = scatter(
         sizes,
-        mean_random;
-        yerror=sem_random .* 1.96,
-        seriestype=:scatter,
+        reference_reinf_mean;
+        yerror=reference_reinf_sem .* 1.96,
         marker=:x,
-        markersize=9,
+        markersize=8,
         color=:gray,
-        label="Null comparison",
+        label="Reinforcing ($(reference_label))",
         xlabel="Loop Size",
         ylabel="Proportion",
-        title=loop_type,
+        title=title,
         ylim=(ymin, ymax),
-        left_margin=10Plots.mm,
-        bottom_margin=8Plots.mm,
         legend=:bottomright,
         background_color_legend=:transparent,
         errorbarcolor=:gray,
         errorbarlinewidth=2,
-        errorbarcap=:round
+        errorbarcap=:round,
+        grid=false
     )
+
     scatter!(
         plt,
         sizes,
-        mean_noiseless;
-        yerror=sem_noiseless .* 1.96,
-        marker=:circle,
+        reference_balanc_mean;
+        yerror=reference_balanc_sem .* 1.96,
+        marker=:x,
         markersize=8,
-        color=color,
-        label="Evolved Comparisons",
-        errorbarcolor=color,
+        color=:darkgray,
+        label="Balancing ($(reference_label))",
+        errorbarcolor=:darkgray,
         errorbarlinewidth=2,
         errorbarcap=:round
     )
+
+    scatter!(
+        plt,
+        sizes,
+        primary_reinf_mean;
+        yerror=primary_reinf_sem .* 1.96,
+        marker=:circle,
+        markersize=8,
+        color=:blue,
+        label="Reinforcing ($(primary_label))",
+        errorbarcolor=:blue,
+        errorbarlinewidth=2,
+        errorbarcap=:round
+    )
+
+    scatter!(
+        plt,
+        sizes,
+        primary_balanc_mean;
+        yerror=primary_balanc_sem .* 1.96,
+        marker=:utriangle,
+        markersize=8,
+        color=:red,
+        label="Balancing ($(primary_label))",
+        errorbarcolor=:red,
+        errorbarlinewidth=2,
+        errorbarcap=:round
+    )
+
     return plt
 end
 
@@ -829,12 +866,6 @@ function save_experiment2_figures(result::Experiment2Result)
     expect_noiseless = summarize_expectations(result.noiseless.ffl)
     expect_noisy = summarize_expectations(result.noisy.ffl)
 
-    plot_noiseless = create_summary_plots(result.noiseless.ffl, expect_random)
-    save_plot(plot_noiseless, "noiseless_vs_random_matrices.png")
-
-    plot_noisy = create_summary_plots(result.noisy.ffl, expect_noiseless)
-    save_plot(plot_noisy, "high_noise_vs_noiseless.png")
-
     expect_random_reinf = summarize_expectations(result.random.fbcks_reinf)
     expect_random_balanc = summarize_expectations(result.random.fbcks_balanc)
     expect_noiseless_reinf = summarize_expectations(result.noiseless.fbcks_reinf)
@@ -842,15 +873,43 @@ function save_experiment2_figures(result::Experiment2Result)
     expect_noisy_reinf = summarize_expectations(result.noisy.fbcks_reinf)
     expect_noisy_balanc = summarize_expectations(result.noisy.fbcks_balanc)
 
-    # max_size = min(result.config.max_loop_size, 4)
     max_size = result.config.max_loop_size
-    p1 = create_summary_plots_fbcks(expect_noiseless_reinf, expect_random_reinf, "Reinforcing, Noiseless"; max_size=max_size, color=:blue)
-    p2 = create_summary_plots_fbcks(expect_noiseless_balanc, expect_random_balanc, "Balancing, Noiseless"; max_size=max_size, color=:red)
-    p3 = create_summary_plots_fbcks(expect_noisy_reinf, expect_noiseless_reinf, "Reinforcing, Very Noisy"; max_size=max_size, color=:blue)
-    p4 = create_summary_plots_fbcks(expect_noisy_balanc, expect_noiseless_balanc, "Balancing, Very Noisy"; max_size=max_size, color=:red)
 
-    final_plot = plot(p1, p2, p3, p4; layout=(2, 2), size=(900, 700))
-    save_plot(final_plot, "concentrations_fbcks.png")
+    noiseless_ffl = create_summary_plots(
+        result.noiseless.ffl,
+        expect_random;
+        title="Feedforward Loops: Noiseless vs Random"
+    )
+    noiseless_fb = feedback_comparison_panel(
+        expect_noiseless_reinf,
+        expect_noiseless_balanc,
+        expect_random_reinf,
+        expect_random_balanc;
+        max_size=max_size,
+        primary_label="Noiseless",
+        reference_label="Random",
+        title="Feedback Loops: Noiseless vs Random"
+    )
+    plot_noiseless = plot(noiseless_ffl, noiseless_fb; layout=(1, 2), size=(1100, 450))
+    save_plot(plot_noiseless, "noiseless_vs_random_matrices.png")
+
+    noisy_ffl = create_summary_plots(
+        result.noisy.ffl,
+        expect_noiseless;
+        title="Feedforward Loops: Noisy vs Noiseless"
+    )
+    noisy_fb = feedback_comparison_panel(
+        expect_noisy_reinf,
+        expect_noisy_balanc,
+        expect_noiseless_reinf,
+        expect_noiseless_balanc;
+        max_size=max_size,
+        primary_label="Very Noisy",
+        reference_label="Noiseless",
+        title="Feedback Loops: Noisy vs Noiseless"
+    )
+    plot_noisy = plot(noisy_ffl, noisy_fb; layout=(1, 2), size=(1100, 450))
+    save_plot(plot_noisy, "high_noise_vs_noiseless.png")
 end
 
 function coherent_fraction_samples(stats::MotifStats)
@@ -871,6 +930,11 @@ function motif_welch_tests(result::Experiment2Result; bonferroni_factor::Int=1)
     noisy_samples = coherent_fraction_samples(result.noisy)
     noiseless_samples = coherent_fraction_samples(result.noiseless)
     random_samples = coherent_fraction_samples(result.random)
+
+    println("Non-evolved coherence: $(mean(random_samples))")
+    println("Noiseless coherence: $(mean(noiseless_samples))")
+    println("Noisy coherence: $(mean(noisy_samples))")
+
     if isempty(noiseless_samples) || isempty(random_samples)
         println("Insufficient motif samples to run Welch's test.")
         return
@@ -902,12 +966,12 @@ end
 
 function main()
     exp1_config = Experiment1Config()
-    exp1_result = run_experiment1(exp1_config)
-    save_experiment1_figures(exp1_result)
-    save_mutational_robustness_plots(exp1_result)
-    alignment_tests(exp1_result; bonferroni_factor=BONFERRONI_TESTS)
-    alignment_regression_plot(exp1_result)
+    # exp1_result = run_experiment1(exp1_config)
+    # save_experiment1_figures(exp1_result)
 
+    # save_mutational_robustness_plots(exp1_result)
+    # alignment_tests(exp1_result; bonferroni_factor=BONFERRONI_TESTS)
+    # alignment_regression_plot(exp1_result)
     base_params = deepcopy(BooleanNetwork.STANDARD_PARAMETERS)
     base_params["G"] = exp1_config.generations
     base_params["pop_size"] = exp1_config.pop_size

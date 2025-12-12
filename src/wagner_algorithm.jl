@@ -28,12 +28,12 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
     """
 
     const STANDARD_PARAMETERS = Dict{String,Any}(
-        "G" => 500, # Number of generations per run
+        "G" => 500, # Number of generations per run (500)
         "max_steps" => 100, # Maximum number of steps before declaring a state unstable
         "s" => 10, # selection pressure
         "unstable_fitness" => exp(-10), # fitness for unstable matrices
         "mode" => "stable", # initialization mode 
-        "pop_size" => 300,
+        "pop_size" => 300, # 300
         "N_target" => 10, # Number of target genes
         "N_regulator" => 0, # Number of non-target genes (not used, yet)
         "c" => 1.0, # initial matrix density

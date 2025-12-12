@@ -89,19 +89,20 @@ struct NoiseScenario
 end
 
 Base.@kwdef struct Experiment1Config
-    generations::Int = 50 # 500
-    pop_size::Int = 30 # 300
+    generations::Int = 500 # 500
+    pop_size::Int = 300 # 300
     mode::String = "stable"
-    trials::Int = 3 # 30
+    trials::Int = 30 # 30
     thetas::Vector{Float64} = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
     robustness_n_mutations::Int = 5
     robustness_n_noise_masks::Int = 30
+    standard_noise::Distribution = Gamma(1.0,1.0)
 end
 
 Base.@kwdef struct Experiment2Config
-    trials::Int = 3 # 30
+    trials::Int = 30 # 30
     max_loop_size::Int = 5 # 5
-    sample_size::Int = 3 # 30
+    sample_size::Int = 30 # 30
 end
 
 struct PopulationRobustnessSummary
@@ -231,7 +232,7 @@ function run_experiment1(config::Experiment1Config)
                 exp_data["initial_state"],
                 config.robustness_n_mutations,
                 config.robustness_n_noise_masks,
-                scenario.distribution;
+                config.standard_noise;
                 mut_prob=local_params["pr"],
                 mr=local_params["mr"],
                 sigma_r=local_params["σr"],
@@ -244,7 +245,7 @@ function run_experiment1(config::Experiment1Config)
                 exp_data["initial_state"],
                 config.robustness_n_mutations,
                 config.robustness_n_noise_masks,
-                scenario.distribution;
+                config.standard_noise;
                 mut_prob=local_params["pr"],
                 mr=local_params["mr"],
                 sigma_r=local_params["σr"],
@@ -699,6 +700,10 @@ function create_summary_plots(data_dict::Dict{String, Vector{Float64}},
     sorted_keys = sort(collect(keys(data_dict)))
     means = [mean(data_dict[k]) for k in sorted_keys]
     ses = [std(data_dict[k]) / sqrt(length(data_dict[k])) for k in sorted_keys]
+    p50_lower = [quantile(data_dict[k], 0.25) for k in sorted_keys]
+    p50_upper = [quantile(data_dict[k], 0.75) for k in sorted_keys]
+    p95_lower = [quantile(data_dict[k], 0.025) for k in sorted_keys]
+    p95_upper = [quantile(data_dict[k], 0.975) for k in sorted_keys]
 
     null_means = [get(null_expectation, k, (0.0, 0.0))[1] for k in sorted_keys]
     null_ses = [get(null_expectation, k, (0.0, 0.0))[2] for k in sorted_keys]
@@ -713,7 +718,7 @@ function create_summary_plots(data_dict::Dict{String, Vector{Float64}},
         color=colors,
         label="Data",
         xlabel="FFL Type",
-        ylabel="Average (%)",
+        ylabel="Concentration (%)",
         xrotation=45,
         title=title,
         legend=:bottomright,
@@ -741,111 +746,88 @@ function create_summary_plots(data_dict::Dict{String, Vector{Float64}},
         errorbarcap=:round
     )
 
-    return p_left
-end
+    ymax = maximum(p95_upper) * 1.1
+    p_right = plot(
+        xlabel="FFL Type",
+        ylabel="Value",
+        xrotation=45,
+        legend=:outertopright,
+        background_color_legend=:transparent,
+        ylim=(0, ymax),
+        left_margin=12Plots.mm,
+        bottom_margin=12Plots.mm
+    )
+    for (idx, key) in enumerate(sorted_keys)
+        label95 = idx == 1 ? "95% Percentile" : ""
+        label50 = idx == 1 ? "50% Percentile" : ""
+        labelNull = idx == 1 ? "Null ± 2 SE" : ""
 
-function feedback_comparison_panel(
-        primary_reinf::Dict{Int, Tuple{Float64, Float64}},
-        primary_balanc::Dict{Int, Tuple{Float64, Float64}},
-        reference_reinf::Dict{Int, Tuple{Float64, Float64}},
-        reference_balanc::Dict{Int, Tuple{Float64, Float64}};
-        max_size::Int,
-        primary_label::String,
-        reference_label::String,
-        title::String)
-
-    function extract_stats(dict::Dict{Int, Tuple{Float64, Float64}}, sizes)
-        means = [get(dict, s, (0.0, 0.0))[1] for s in sizes]
-        sems = [get(dict, s, (0.0, 0.0))[2] for s in sizes]
-        return means, sems
+        plot!(p_right, [key, key], [p95_lower[idx], p95_upper[idx]]; color=:gray, lw=6, alpha=0.5, label=label95)
+        plot!(p_right, [key, key], [p50_lower[idx], p50_upper[idx]]; color=colors[idx], lw=8, alpha=0.8, label=label50)
+        plot!(p_right, [key, key], [null_means[idx] - 1.96 * null_ses[idx], null_means[idx] + 1.96 * null_ses[idx]];
+            color=:black, lw=2, alpha=0.9, label=labelNull)
+        scatter!(p_right, [key], [null_means[idx]]; color=:black, marker=:x, label="")
     end
 
+    return plot(p_left, p_right; layout=(1, 2), size=(1100, 500))
+end
+
+function create_summary_plots_fbcks(expectations_primary::Dict{Int, Tuple{Float64, Float64}},
+        expectations_reference::Dict{Int, Tuple{Float64, Float64}},
+        title::String;
+        max_size::Int=4,
+        color=:blue,
+        reference_label::String="Reference",
+        primary_label::String="Primary")
+
     sizes = 1:max_size
-    primary_reinf_mean, primary_reinf_sem = extract_stats(primary_reinf, sizes)
-    primary_balanc_mean, primary_balanc_sem = extract_stats(primary_balanc, sizes)
-    reference_reinf_mean, reference_reinf_sem = extract_stats(reference_reinf, sizes)
-    reference_balanc_mean, reference_balanc_sem = extract_stats(reference_balanc, sizes)
+    mean_primary = [get(expectations_primary, s, (NaN, NaN))[1] for s in sizes]
+    sem_primary = [get(expectations_primary, s, (NaN, NaN))[2] for s in sizes]
+    mean_reference = [get(expectations_reference, s, (NaN, NaN))[1] for s in sizes]
+    sem_reference = [get(expectations_reference, s, (NaN, NaN))[2] for s in sizes]
 
-    lower_bounds = minimum([
-        minimum(primary_reinf_mean .- 1.96 .* primary_reinf_sem),
-        minimum(primary_balanc_mean .- 1.96 .* primary_balanc_sem),
-        minimum(reference_reinf_mean .- 1.96 .* reference_reinf_sem),
-        minimum(reference_balanc_mean .- 1.96 .* reference_balanc_sem)
-    ])
+    lower_bounds = min.(mean_primary .- 1.96 .* sem_primary, mean_reference .- 1.96 .* sem_reference)
+    upper_bounds = max.(mean_primary .+ 1.96 .* sem_primary, mean_reference .+ 1.96 .* sem_reference)
+    global_min = minimum(lower_bounds)
+    global_max = maximum(upper_bounds)
+    padding = max(0.05, 0.1 * (global_max - global_min))
+    ymin = clamp(global_min - padding, 0.0, 1.0)
+    ymax = clamp(global_max + padding, 0.0, 1.0)
 
-    upper_bounds = maximum([
-        maximum(primary_reinf_mean .+ 1.96 .* primary_reinf_sem),
-        maximum(primary_balanc_mean .+ 1.96 .* primary_balanc_sem),
-        maximum(reference_reinf_mean .+ 1.96 .* reference_reinf_sem),
-        maximum(reference_balanc_mean .+ 1.96 .* reference_balanc_sem)
-    ])
-
-    padding = max(0.05, 0.1 * (upper_bounds - lower_bounds))
-    ymin = clamp(lower_bounds - padding, 0.0, 1.0)
-    ymax = clamp(upper_bounds + padding, 0.0, 1.0)
-
-    plt = scatter(
+    plt = plot(
         sizes,
-        reference_reinf_mean;
-        yerror=reference_reinf_sem .* 1.96,
+        mean_reference;
+        yerror=sem_reference .* 1.96,
+        seriestype=:scatter,
         marker=:x,
-        markersize=8,
+        markersize=9,
         color=:gray,
-        label="Reinforcing ($(reference_label))",
+        label=reference_label,
         xlabel="Loop Size",
-        ylabel="Proportion",
+        ylabel="Concentration",
         title=title,
         ylim=(ymin, ymax),
+        left_margin=10Plots.mm,
+        bottom_margin=8Plots.mm,
         legend=:bottomright,
         background_color_legend=:transparent,
         errorbarcolor=:gray,
         errorbarlinewidth=2,
-        errorbarcap=:round,
-        grid=false
-    )
-
-    scatter!(
-        plt,
-        sizes,
-        reference_balanc_mean;
-        yerror=reference_balanc_sem .* 1.96,
-        marker=:x,
-        markersize=8,
-        color=:darkgray,
-        label="Balancing ($(reference_label))",
-        errorbarcolor=:darkgray,
-        errorbarlinewidth=2,
         errorbarcap=:round
     )
-
     scatter!(
         plt,
         sizes,
-        primary_reinf_mean;
-        yerror=primary_reinf_sem .* 1.96,
+        mean_primary;
+        yerror=sem_primary .* 1.96,
         marker=:circle,
         markersize=8,
-        color=:blue,
-        label="Reinforcing ($(primary_label))",
-        errorbarcolor=:blue,
+        color=color,
+        label=primary_label,
+        errorbarcolor=color,
         errorbarlinewidth=2,
         errorbarcap=:round
     )
-
-    scatter!(
-        plt,
-        sizes,
-        primary_balanc_mean;
-        yerror=primary_balanc_sem .* 1.96,
-        marker=:utriangle,
-        markersize=8,
-        color=:red,
-        label="Balancing ($(primary_label))",
-        errorbarcolor=:red,
-        errorbarlinewidth=2,
-        errorbarcap=:round
-    )
-
     return plt
 end
 
@@ -880,17 +862,26 @@ function save_experiment2_figures(result::Experiment2Result)
         expect_random;
         title="Feedforward Loops: Noiseless vs Random"
     )
-    noiseless_fb = feedback_comparison_panel(
+    noiseless_reinf = create_summary_plots_fbcks(
         expect_noiseless_reinf,
-        expect_noiseless_balanc,
         expect_random_reinf,
-        expect_random_balanc;
+        "Positive (Reinforcing) Feedback";
         max_size=max_size,
-        primary_label="Noiseless",
+        color=:blue,
         reference_label="Random",
-        title="Feedback Loops: Noiseless vs Random"
+        primary_label="Noiseless"
     )
-    plot_noiseless = plot(noiseless_ffl, noiseless_fb; layout=(1, 2), size=(1100, 450))
+    noiseless_balanc = create_summary_plots_fbcks(
+        expect_noiseless_balanc,
+        expect_random_balanc,
+        "Negative (Balancing) Feedback";
+        max_size=max_size,
+        color=:red,
+        reference_label="Random",
+        primary_label="Noiseless"
+    )
+    noiseless_bottom = plot(noiseless_reinf, noiseless_balanc; layout=(1, 2), size=(1100, 400))
+    plot_noiseless = plot(noiseless_ffl, noiseless_bottom; layout=(2, 1), size=(1100, 900))
     save_plot(plot_noiseless, "noiseless_vs_random_matrices.png")
 
     noisy_ffl = create_summary_plots(
@@ -898,17 +889,26 @@ function save_experiment2_figures(result::Experiment2Result)
         expect_noiseless;
         title="Feedforward Loops: Noisy vs Noiseless"
     )
-    noisy_fb = feedback_comparison_panel(
+    noisy_reinf = create_summary_plots_fbcks(
         expect_noisy_reinf,
-        expect_noisy_balanc,
         expect_noiseless_reinf,
-        expect_noiseless_balanc;
+        "Reinforcing Feedback";
         max_size=max_size,
-        primary_label="Very Noisy",
+        color=:blue,
         reference_label="Noiseless",
-        title="Feedback Loops: Noisy vs Noiseless"
+        primary_label="Very Noisy"
     )
-    plot_noisy = plot(noisy_ffl, noisy_fb; layout=(1, 2), size=(1100, 450))
+    noisy_balanc = create_summary_plots_fbcks(
+        expect_noisy_balanc,
+        expect_noiseless_balanc,
+        "Balancing Feedback";
+        max_size=max_size,
+        color=:red,
+        reference_label="Noiseless",
+        primary_label="Very Noisy"
+    )
+    noisy_bottom = plot(noisy_reinf, noisy_balanc; layout=(1, 2), size=(1100, 400))
+    plot_noisy = plot(noisy_ffl, noisy_bottom; layout=(2, 1), size=(1100, 900))
     save_plot(plot_noisy, "high_noise_vs_noiseless.png")
 end
 
@@ -966,12 +966,12 @@ end
 
 function main()
     exp1_config = Experiment1Config()
-    # exp1_result = run_experiment1(exp1_config)
-    # save_experiment1_figures(exp1_result)
+    exp1_result = run_experiment1(exp1_config)
+    save_experiment1_figures(exp1_result)
 
-    # save_mutational_robustness_plots(exp1_result)
-    # alignment_tests(exp1_result; bonferroni_factor=BONFERRONI_TESTS)
-    # alignment_regression_plot(exp1_result)
+    save_mutational_robustness_plots(exp1_result)
+    alignment_tests(exp1_result; bonferroni_factor=BONFERRONI_TESTS)
+    alignment_regression_plot(exp1_result)
     base_params = deepcopy(BooleanNetwork.STANDARD_PARAMETERS)
     base_params["G"] = exp1_config.generations
     base_params["pop_size"] = exp1_config.pop_size

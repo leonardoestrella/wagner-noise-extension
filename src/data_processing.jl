@@ -290,7 +290,7 @@ const MutationalRobustnessSummary = NamedTuple{
                 activation
             )
 
-            expression_shifts[mutation_idx] = mean(abs.(mutated_mean .- baseline_mean))
+            expression_shifts[mutation_idx] = sum(abs.(mutated_mean .- baseline_mean))
             unstable_probability_shifts[mutation_idx] = abs(mutated_unstable_prob - baseline_unstable_prob)
         end
 
@@ -301,40 +301,6 @@ const MutationalRobustnessSummary = NamedTuple{
     end   
 
     """
-        compute_population_mut_robustness(matrices::AbstractVector{Matrix{Float64}},
-                                        initial_state::Vector{Int},
-                                        n_mutations::Int,
-                                        n_noise_masks::Int,
-                                        noise_dist::Distribution; kwargs...) 
-            -> Vector{MutationalRobustnessSummary}
-
-    Compute mutational robustness summaries for every matrix within a population.
-    Returns a vector with one `MutationalRobustnessSummary` per network in the
-    order provided.
-    """
-    function compute_population_mut_robustness(
-        matrices::AbstractVector{Matrix{Float64}},
-        initial_state::Vector{Int},
-        n_mutations::Int,
-        n_noise_masks::Int,
-        noise_dist::Distribution;
-        kwargs...
-    )::Vector{MutationalRobustnessSummary}
-        results = Vector{MutationalRobustnessSummary}(undef, length(matrices))
-        for (idx, matrix) in enumerate(matrices)
-            results[idx] = compute_mut_robustness(
-                matrix,
-                initial_state,
-                n_mutations,
-                n_noise_masks,
-                noise_dist;
-                kwargs...
-            )
-        end
-        return results
-    end
-
-    """
         compute_population_mut_robustness(matrices::AbstractArray{Matrix{Float64}}, 
                                         initial_state::Vector{Int},
                                         n_mutations::Int,
@@ -342,8 +308,8 @@ const MutationalRobustnessSummary = NamedTuple{
                                         noise_dist::Distribution; kwargs...) 
             -> Array{MutationalRobustnessSummary}
 
-    Array-based overload returning results with the same shape as the input
-    matrix collection.
+    Compute mutational robustness for every matrix in `matrices`, returning an
+    array of `MutationalRobustnessSummary` with the same shape as the input.
     """
     function compute_population_mut_robustness(
         matrices::AbstractArray{Matrix{Float64}},

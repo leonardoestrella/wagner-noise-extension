@@ -20,8 +20,10 @@ Base.@kwdef struct PlotScenario
 end
 
 struct PlotPopulationRobustnessSummary
-    mean_expression_shift::Matrix{Float64}
-    mean_unstable_shift::Matrix{Float64}
+    stable_expression_shift_population::Matrix{Float64}
+    stable_expression_variance_population::Matrix{Float64}
+    unstable_probability_shift_population::Matrix{Float64}
+    unstable_probability_variance_population::Matrix{Float64}
 end
 
 Base.@kwdef struct PlotExperiment1Config
@@ -120,12 +122,16 @@ function exp1_to_plot_payload(result)::Dict{String,Any}
         "sems" => Dict(String(k) => matrix_to_rows(v) for (k, v) in result.sems),
         "final_alignments" => matrix_to_rows(result.final_alignments),
         "initial_robustness" => Dict(
-            "mean_expression_shift" => matrix_to_rows(result.initial_robustness.mean_expression_shift),
-            "mean_unstable_shift" => matrix_to_rows(result.initial_robustness.mean_unstable_shift),
+            "stable_expression_shift_population" => matrix_to_rows(result.initial_robustness.stable_expression_shift_population),
+            "stable_expression_variance_population" => matrix_to_rows(result.initial_robustness.stable_expression_variance_population),
+            "unstable_probability_shift_population" => matrix_to_rows(result.initial_robustness.unstable_probability_shift_population),
+            "unstable_probability_variance_population" => matrix_to_rows(result.initial_robustness.unstable_probability_variance_population),
         ),
         "final_robustness" => Dict(
-            "mean_expression_shift" => matrix_to_rows(result.final_robustness.mean_expression_shift),
-            "mean_unstable_shift" => matrix_to_rows(result.final_robustness.mean_unstable_shift),
+            "stable_expression_shift_population" => matrix_to_rows(result.final_robustness.stable_expression_shift_population),
+            "stable_expression_variance_population" => matrix_to_rows(result.final_robustness.stable_expression_variance_population),
+            "unstable_probability_shift_population" => matrix_to_rows(result.final_robustness.unstable_probability_shift_population),
+            "unstable_probability_variance_population" => matrix_to_rows(result.final_robustness.unstable_probability_variance_population),
         ),
         "config" => Dict(
             "generations" => Int(result.config.generations),
@@ -193,10 +199,17 @@ function normalize_exp1_payload(raw::Dict{String,Any})::PlotExperiment1Result
     end
 
     final_alignments = matrix_from_payload(raw["final_alignments"], n_scenarios, trials)
-    initial_expr = matrix_from_payload(raw["initial_robustness"]["mean_expression_shift"], n_scenarios, trials)
-    initial_unstable = matrix_from_payload(raw["initial_robustness"]["mean_unstable_shift"], n_scenarios, trials)
-    final_expr = matrix_from_payload(raw["final_robustness"]["mean_expression_shift"], n_scenarios, trials)
-    final_unstable = matrix_from_payload(raw["final_robustness"]["mean_unstable_shift"], n_scenarios, trials)
+
+    init_expr_shift = matrix_from_payload(raw["initial_robustness"]["stable_expression_shift_population"], n_scenarios, trials)
+    init_expr_var = matrix_from_payload(raw["initial_robustness"]["stable_expression_variance_population"], n_scenarios, trials)
+    init_unstable_shift = matrix_from_payload(raw["initial_robustness"]["unstable_probability_shift_population"], n_scenarios, trials)
+    init_unstable_var = matrix_from_payload(raw["initial_robustness"]["unstable_probability_variance_population"], n_scenarios, trials)
+
+    final_expr_shift = matrix_from_payload(raw["final_robustness"]["stable_expression_shift_population"], n_scenarios, trials)
+    final_expr_var = matrix_from_payload(raw["final_robustness"]["stable_expression_variance_population"], n_scenarios, trials)
+    final_unstable_shift = matrix_from_payload(raw["final_robustness"]["unstable_probability_shift_population"], n_scenarios, trials)
+    final_unstable_var = matrix_from_payload(raw["final_robustness"]["unstable_probability_variance_population"], n_scenarios, trials)
+
 
     config = PlotExperiment1Config(
         generations=generations,
@@ -208,8 +221,8 @@ function normalize_exp1_payload(raw::Dict{String,Any})::PlotExperiment1Result
         robustness_n_noise_masks=Int(get(cfg, "robustness_n_noise_masks", 0)),
     )
 
-    initial_summary = PlotPopulationRobustnessSummary(initial_expr, initial_unstable)
-    final_summary = PlotPopulationRobustnessSummary(final_expr, final_unstable)
+    initial_summary = PlotPopulationRobustnessSummary(init_expr_shift, init_expr_var, init_unstable_shift, init_unstable_var)
+    final_summary = PlotPopulationRobustnessSummary(final_expr_shift, final_expr_var, final_unstable_shift, final_unstable_var)
 
     return PlotExperiment1Result(
         scenarios,

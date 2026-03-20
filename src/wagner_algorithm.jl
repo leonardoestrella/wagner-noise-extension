@@ -64,7 +64,7 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
     # Returns
     - Vector or matrix of same shape as input with values ∈ {-1.0, 1.0}
     """
-    function activation(x::AbstractVecOrMat{<:Real})
+    function activation(x)
         return sign.(x)
     end
 
@@ -137,6 +137,67 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
             buffer2 .= activation(buffer2)  # In-place activation
         end
         
+        return nothing, nothing
+    end
+    
+    """
+        develop_asynchronous(
+            W::NetworkMatrix,
+            initial_state::GeneState,
+            max_steps::Integer,
+            activation::Function;
+            buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1))
+        ) -> Tuple{Union{Vector{Float64},Nothing}, Union{Int,Nothing}}
+
+    Develop network phenotype via **asynchronous** (gene-by-gene) updates until a
+    full sweep produces no changes or `max_steps` sweeps are reached.
+
+    # Arguments
+    - `W`: Weight matrix (Ng × Ng)
+    - `initial_state`: Initial gene expression state (length Ng)
+    - `max_steps`: Maximum number of full sweeps
+    - `activation`: Maps the weighted input of a gene to its next value (e.g., `sign`, `tanh`, etc.)
+    - `buffer1`: Pre-allocated buffer holding the evolving state
+
+    # Returns
+    - `(final_state, sweeps_taken)` if stabilized, else `(nothing, nothing)`
+    """
+    function develop_asynchronous(
+        W::NetworkMatrix,
+        initial_state::GeneState,
+        max_steps::Integer,
+        activation::Function;
+        buffer1::Vector{Float64}=Vector{Float64}(undef, size(W, 1))
+    )::Tuple{Union{Vector{Float64},Nothing},Union{Int,Nothing}}
+
+        Ng = size(W, 1)
+        @assert size(W, 2) == Ng "W must be square (Ng×Ng)."
+        @assert length(initial_state) == Ng "initial_state must have length Ng."
+        @assert length(buffer1) == Ng "buffer1 must have length Ng."
+
+        # initialize state
+        copyto!(buffer1, Float64.(initial_state))
+
+        for sweep in 1:max_steps
+            changed = false
+
+            # update each gene using the latest state (asynchronous)
+            @inbounds for i in 1:Ng
+                input = dot(view(W, i, :), buffer1)
+                newval = activation(input)
+
+                if newval != buffer1[i]
+                    buffer1[i] = newval
+                    changed = true
+                end
+            end
+
+            # no gene state changed in the last sweep, return the state
+            if !changed
+                return buffer1, sweep
+            end
+        end
+
         return nothing, nothing
     end
 
@@ -264,6 +325,8 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
                            )::Tuple{Bool, Union{Vector{Float64}, Nothing}, Union{Int, Nothing}}
         phenotype, steps = develop(W, initial_state, max_steps, activation; 
                                  buffer1=buffer1, buffer2=buffer2)
+        # phenotype, steps = develop_asynchronous(W, initial_state, max_steps, activation; 
+        #                          buffer1=buffer1)
         return phenotype !== nothing, phenotype, steps
     end
 
@@ -795,6 +858,7 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
 
                 # find stable state
                 phenotype, path_length = develop(noisy_W, initial_state, max_steps, activation)
+                # phenotype, path_length = develop_asynchronous(noisy_W, initial_state, max_steps, activation)
 
                 # compute fitness
                 fit = indiv_fitness(phenotype, phenotypic_optima, N_target, s, distance, unstable_fitness)
@@ -934,6 +998,7 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
             copyto!(noisy_W, matrix) # copy contents
             apply_noise!(noisy_W, noise_prob, noise_dist)
             phenotype, path_length = develop(noisy_W, population.initial_state, max_steps, activation)
+            # phenotype, path_length = develop_asynchronous(noisy_W, population.initial_state, max_steps, activation)
 
             fit = indiv_fitness(phenotype, phenotypic_optima, N_target, s, distance, unstable_fitness)
             fitness_history[1,index] = fit

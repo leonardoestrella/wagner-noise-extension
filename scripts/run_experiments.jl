@@ -69,8 +69,10 @@ export save_experiment_results, load_experiment_results
     end
 
     struct PopulationRobustnessSummary
-        mean_expression_shift::Matrix{Float64}
-        mean_unstable_shift::Matrix{Float64}
+        stable_expression_shift_population::Matrix{Float64}
+        stable_expression_variance_population::Matrix{Float64}
+        unstable_probability_shift_population::Matrix{Float64}
+        unstable_probability_variance_population::Matrix{Float64}
     end
 
     struct Experiment1Result
@@ -153,10 +155,17 @@ export save_experiment_results, load_experiment_results
         averages = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
         sems = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
         final_alignments = zeros(length(scenarios), config.trials)
-        init_expr_shift = zeros(length(scenarios), config.trials)
-        init_unstable = zeros(length(scenarios), config.trials)
-        final_expr_shift = zeros(length(scenarios), config.trials)
-        final_unstable = zeros(length(scenarios), config.trials)
+
+        init_stab_expr_shift = zeros(length(scenarios), config.trials)
+        init_stab_expr_var = zeros(length(scenarios), config.trials)
+        init_prob_expr_shift = zeros(length(scenarios), config.trials)
+        init_prob_expr_var = zeros(length(scenarios), config.trials)
+
+        final_stab_expr_shift = zeros(length(scenarios), config.trials)
+        final_stab_expr_var = zeros(length(scenarios), config.trials)
+        final_prob_expr_shift = zeros(length(scenarios), config.trials)
+        final_prob_expr_var = zeros(length(scenarios), config.trials)
+
 
         progress = Progress(length(scenarios); desc="Experiment 1 – noise schedules")
         for (noise_idx, scenario) in enumerate(scenarios)
@@ -219,10 +228,16 @@ export save_experiment_results, load_experiment_results
                     activation=BooleanNetwork.activation
                 )
 
-                init_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :mean_expression_shift))
-                init_unstable[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :mean_unstable_shift))
-                final_expr_shift[noise_idx, trial_idx] = mean(getfield.(final_robustness, :mean_expression_shift))
-                final_unstable[noise_idx, trial_idx] = mean(getfield.(final_robustness, :mean_unstable_shift))
+                init_stab_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness,:stable_expression_shift))
+                init_stab_expr_var[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :stable_expression_variance))
+                init_prob_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :unstable_probability_shift))
+                init_prob_expr_var[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :unstable_probability_variance))
+
+                final_stab_expr_shift[noise_idx, trial_idx] = mean(getfield.(final_robustness, :stable_expression_shift))
+                final_stab_expr_var[noise_idx, trial_idx] = mean(getfield.(final_robustness, :stable_expression_variance))
+                final_prob_expr_shift[noise_idx, trial_idx] = mean(getfield.(final_robustness, :unstable_probability_shift))
+                final_prob_expr_var[noise_idx, trial_idx] = mean(getfield.(final_robustness, :unstable_probability_variance))
+
             end
 
             means, sem_vals = column_mean_and_sem(all_fit)
@@ -244,8 +259,8 @@ export save_experiment_results, load_experiment_results
             next!(progress)
         end
 
-        initial_summary = PopulationRobustnessSummary(init_expr_shift, init_unstable)
-        final_summary = PopulationRobustnessSummary(final_expr_shift, final_unstable)
+        initial_summary = PopulationRobustnessSummary(init_stab_expr_shift, init_stab_expr_var, init_prob_expr_shift, init_prob_expr_var)
+        final_summary = PopulationRobustnessSummary(final_stab_expr_shift, final_stab_expr_var, final_prob_expr_shift, final_prob_expr_var)
         return Experiment1Result(scenarios, averages, sems, final_alignments, initial_summary, final_summary, config)
     end
 

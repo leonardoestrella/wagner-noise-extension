@@ -1,6 +1,7 @@
 include("../src/wagner_algorithm.jl")
 using Random
 using Distributions
+using LinearAlgebra
 
 # For reproducibility
 Random.seed!(12345)
@@ -47,6 +48,37 @@ end
     # Test unstable state
     W_unstable = -W
     @test !BooleanNetwork.check_stability(W_unstable, s, max_steps, activation)[1]
+end
+
+# Test asynchronous development
+@testset "develop_asynchronous" begin
+    activation = sign
+
+    # 1) Basic behavior: asynchronous updates should reach the expected fixed point
+    W = [0.0 2.0;
+         2.0 0.0]
+    initial_state = [1, -1]
+    final_state, sweeps = BooleanNetwork.develop_asynchronous(W, initial_state, 10, activation)
+    @test final_state !== nothing
+    @test sweeps == 2
+    @test final_state == [-1.0, -1.0]
+
+    # 2) Termination case: identity matrix with all-ones state should stabilize immediately
+    N = 6
+    W_identity = Matrix{Float64}(I, N, N)
+    ones_state = ones(Int, N)
+    final_identity, sweeps_identity = BooleanNetwork.develop_asynchronous(
+        W_identity, ones_state, 100, activation
+    )
+    @test final_identity !== nothing
+    @test sweeps_identity == 1
+    @test final_identity == ones(Float64, N)
+
+    # 3) Input immutability: function must not mutate initial_state
+    immutable_check_state = [1, -1, 1, -1]
+    original_copy = copy(immutable_check_state)
+    _ = BooleanNetwork.develop_asynchronous(Matrix{Float64}(I, 4, 4), immutable_check_state, 5, activation)
+    @test immutable_check_state == original_copy
 end
 
 # Test mutation and noise operations 

@@ -30,8 +30,8 @@ const GenerationSummary = NamedTuple{
     Tuple{Float64, Float64, Float64, Float64, Float64, Float64, Float64}
 }
 const MutationalRobustnessSummary = NamedTuple{
-    (:mean_expression_shift, :mean_unstable_shift),
-    Tuple{Float64, Float64}
+    (:stable_expression_shift, :stable_expression_variance, :unstable_probability_shift, :unstable_probability_variance),
+    Tuple{Float64, Float64, Float64, Float64}
 }
 
     """
@@ -203,7 +203,8 @@ const MutationalRobustnessSummary = NamedTuple{
             BooleanNetwork.apply_noise!(buffer_matrix, noise_prob, noise_dist)
 
             final_state, _ = BooleanNetwork.develop(buffer_matrix, initial_state, max_steps, activation)
-            
+            # final_state, _ = BooleanNetwork.develop_asynchronous(buffer_matrix, initial_state, max_steps, activation)
+
             if final_state !== nothing
                 stable_count += 1
                 stable_states[stable_count, :] = final_state
@@ -256,8 +257,8 @@ const MutationalRobustnessSummary = NamedTuple{
                             noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
                             max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
                             activation=BooleanNetwork.activation)::MutationalRobustnessSummary
-        if n_mutations <= 0
-            return (mean_expression_shift=0.0, mean_unstable_shift=0.0)
+        if n_mutations <= 1
+            error("n_mutations must be larger than 1!") # Raises an ErrorException
         end
 
         mutation_dist = Normal(mr,sigma_r)
@@ -272,8 +273,9 @@ const MutationalRobustnessSummary = NamedTuple{
             activation
         )
 
-        expression_shifts = Vector{Float64}(undef, n_mutations)
-        unstable_probability_shifts = Vector{Float64}(undef, n_mutations)
+        stable_expressions = Matrix{Float64}(undef, n_mutations, n_genes)
+        # avg_stable_shift = Vector{Float64}(undef, n_mutations)
+        unstable_probabilities = Vector{Float64}(undef,n_mutations)
         mutated_matrix = Matrix{Float64}(undef, n_genes, n_genes)
 
         for mutation_idx in 1:n_mutations
@@ -281,22 +283,34 @@ const MutationalRobustnessSummary = NamedTuple{
             BooleanNetwork.reg_mutation!(mutated_matrix, mut_prob, mutation_dist)
 
             mutated_mean, mutated_unstable_prob = generate_expression_distribution(
-                mutated_matrix,
-                initial_state,
-                n_noise_masks,
-                noise_dist,
-                noise_prob,
-                max_steps,
-                activation
+                mutated_matrix, initial_state, n_noise_masks,
+                noise_dist, noise_prob,max_steps,activation
             )
 
-            expression_shifts[mutation_idx] = sum(abs.(mutated_mean .- baseline_mean))
-            unstable_probability_shifts[mutation_idx] = abs(mutated_unstable_prob - baseline_unstable_prob)
+            stable_expressions[mutation_idx,:] = mutated_mean
+            unstable_probabilities[mutation_idx] = mutated_unstable_prob
         end
 
+        # Mean across mutations
+        mean_stable_expression_mutations = vec(mean(stable_expressions, dims=1))
+        stable_expression_shift = norm(baseline_mean - mean_stable_expression_mutations,1)
+
+        # Variance across mutations, per entry
+        variances_stable_expression_mutations= var(stable_expressions, dims = 1, corrected = true)
+        stable_expression_variance = sum(variances_stable_expression_mutations)
+
+        # Mean across mutations
+        mean_unstable_prob_mutations = mean(unstable_probabilities)
+        unstable_probability_shift = baseline_unstable_prob - mean_unstable_prob_mutations
+
+        # Variance across mutations
+        unstable_probability_variance = var(unstable_probabilities, corrected = true)
+
         return (
-            mean_expression_shift=mean(expression_shifts),
-            mean_unstable_shift=mean(unstable_probability_shifts)
+            stable_expression_shift = stable_expression_shift,
+            stable_expression_variance = stable_expression_variance,
+            unstable_probability_shift = unstable_probability_shift,
+            unstable_probability_variance = unstable_probability_variance
         )
     end   
 

@@ -3,6 +3,7 @@ include("../src/data_processing.jl")
 using Test
 using Random
 using Distributions
+using LinearAlgebra
 
 
 # Deterministic RNG where needed
@@ -98,16 +99,16 @@ end
 
 function reference_mutational_summary(matrix, initial_state, n_mutations, n_noise_masks, noise_dist;
                                       mut_prob, mr, sigma_r, noise_prob, max_steps, activation)
-    if n_mutations <= 0
-        return (mean_expression_shift=0.0, mean_unstable_shift=0.0)
+    if n_mutations <= 1
+        error("n_mutations must be larger than 1!")
     end
 
     mutation_dist = Normal(mr, sigma_r)
     baseline_mean, baseline_unstable = CustomStats.generate_expression_distribution(
         matrix, initial_state, n_noise_masks, noise_dist, noise_prob, max_steps, activation)
 
-    expression_shifts = zeros(n_mutations)
-    unstable_probability_shifts = zeros(n_mutations)
+    stable_expressions = Matrix{Float64}(undef, n_mutations, size(matrix, 1))
+    unstable_probabilities = zeros(n_mutations)
     mutated_matrix = similar(matrix)
 
     for mutation_idx in 1:n_mutations
@@ -117,13 +118,21 @@ function reference_mutational_summary(matrix, initial_state, n_mutations, n_nois
         mutated_mean, mutated_unstable = CustomStats.generate_expression_distribution(
             mutated_matrix, initial_state, n_noise_masks, noise_dist, noise_prob, max_steps, activation)
 
-        expression_shifts[mutation_idx] = mean(abs.(mutated_mean .- baseline_mean))
-        unstable_probability_shifts[mutation_idx] = mutated_unstable - baseline_unstable
+        stable_expressions[mutation_idx, :] = mutated_mean
+        unstable_probabilities[mutation_idx] = mutated_unstable
     end
 
+    mean_stable_expression_mutations = vec(mean(stable_expressions, dims=1))
+    stable_expression_shift = norm(baseline_mean .- mean_stable_expression_mutations, 1)
+    stable_expression_variance = sum(var(stable_expressions, dims=1, corrected=true))
+    unstable_probability_shift = baseline_unstable - mean(unstable_probabilities)
+    unstable_probability_variance = var(unstable_probabilities, corrected=true)
+
     return (
-        mean_expression_shift=mean(expression_shifts),
-        mean_unstable_shift=mean(unstable_probability_shifts)
+        stable_expression_shift=stable_expression_shift,
+        stable_expression_variance=stable_expression_variance,
+        unstable_probability_shift=unstable_probability_shift,
+        unstable_probability_variance=unstable_probability_variance
     )
 end
 
@@ -139,7 +148,7 @@ end
     mr = 0.0
     sigma_r = 0.25
     noise_prob = 0.0
-    max_steps = 8
+    max_steps = 20
     activation = CustomStats.BooleanNetwork.activation
 
     Random.seed!(2024)
@@ -172,10 +181,12 @@ end
         activation=activation
     )
 
-    @test isapprox(robustness.mean_expression_shift, reference.mean_expression_shift; atol=1e-12)
-    @test isapprox(robustness.mean_unstable_shift, reference.mean_unstable_shift; atol=1e-12)
+    @test isapprox(robustness.stable_expression_shift, reference.stable_expression_shift; atol=1e-12)
+    @test isapprox(robustness.stable_expression_variance, reference.stable_expression_variance; atol=1e-12)
+    @test isapprox(robustness.unstable_probability_shift, reference.unstable_probability_shift; atol=1e-12)
+    @test isapprox(robustness.unstable_probability_variance, reference.unstable_probability_variance; atol=1e-12)
 
-    zero_mut = CustomStats.compute_mut_robustness(
+    @test_throws ErrorException CustomStats.compute_mut_robustness(
         matrix,
         initial_state,
         0,
@@ -186,7 +197,6 @@ end
         sigma_r=sigma_r,
         noise_prob=noise_prob
     )
-    @test zero_mut == (mean_expression_shift=0.0, mean_unstable_shift=0.0)
 end
 
 @testset "compute_mut_robustness noise/mutation combinations" begin
@@ -209,8 +219,10 @@ end
         sigma_r=0.0,
         noise_prob=0.9
     )
-    @test isapprox(noise_only.mean_expression_shift, 0.2; atol=1e-12)
-    @test isapprox(noise_only.mean_unstable_shift, -0.05; atol=1e-12)
+    @test !isapprox(noise_only.stable_expression_shift, 0.0; atol=1e-12)
+    @test noise_only.stable_expression_variance >= 0.0
+    @test !isapprox(noise_only.unstable_probability_shift, 0.0; atol=1e-12)
+    @test noise_only.unstable_probability_variance >= 0.0
 
     Random.seed!(7)
     mutation_only = CustomStats.compute_mut_robustness(
@@ -223,8 +235,10 @@ end
         sigma_r=0.4,
         noise_prob=0.0
     )
-    @test isapprox(mutation_only.mean_expression_shift, 0.4; atol=1e-12)
-    @test isapprox(mutation_only.mean_unstable_shift, -0.4; atol=1e-12)
+    @test !isapprox(mutation_only.stable_expression_shift, 0.0; atol=1e-12)
+    @test mutation_only.stable_expression_variance >= 0.0
+    @test !isapprox(mutation_only.unstable_probability_shift, 0.0; atol=1e-12)
+    @test mutation_only.unstable_probability_variance >= 0.0
 
     Random.seed!(7)
     combined = CustomStats.compute_mut_robustness(
@@ -237,8 +251,10 @@ end
         sigma_r=0.4,
         noise_prob=0.8
     )
-    @test isapprox(combined.mean_expression_shift, 0.13333333333333333; atol=1e-12)
-    @test isapprox(combined.mean_unstable_shift, -0.15; atol=1e-12)
+    @test !isapprox(combined.stable_expression_shift, 0.0; atol=1e-12)
+    @test combined.stable_expression_variance >= 0.0
+    @test !isapprox(combined.unstable_probability_shift, 0.0; atol=1e-12)
+    @test combined.unstable_probability_variance >= 0.0
 end
 
 @testset "compute_population_mut_robustness" begin

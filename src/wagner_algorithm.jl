@@ -1030,7 +1030,7 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
                     "path_length" => path_length_history,
                     "completion" => completion,
                     "initial_state" => population.initial_state,
-                    "phenotypic_optima" => population.phenotypic_optima)
+                    "phenotypic_optima" => population.phenotypic_optima) #TODO - might change data type with changing environments
 
         return data
     end

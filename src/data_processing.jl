@@ -13,10 +13,11 @@ using .BooleanNetwork
 
 export
     # Simulation summary functions
-    summarize_simulation_run,
-    compute_fitness_stats,
-    compute_path_stats,
-    compute_alignment_stats,
+    summarize_simulation_run, 
+    compute_fitness_stats, # TODO - Deprecate or apply in a generalized form. 
+    compute_path_stats, # ''
+    compute_alignment_stats, # '' 
+    compute_all_alignments,
     # Population analysis functions
     compute_mut_robustness,
     compute_population_mut_robustness

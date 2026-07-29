@@ -4,6 +4,11 @@ Compute-only runner for the two manuscript experiments.
 Returns experiment results without plotting or saving figures.
 """
 
+"""
+JULY 28, 2026 - It is currently under refactoring. Leo will delete
+plot_payload to simplify code, and will use JLD2
+"""
+
 module ExperimentHandler
 
 using Distributions
@@ -19,6 +24,7 @@ using PyCall: PyVector, pyimport, PyObject
 using LinearAlgebra
 using Base.Threads
 
+
 export run_experiment1, run_experiment2, Experiment1Config, Experiment2Config, build_noise_scenarios
 export save_experiment_results, load_experiment_results
 
@@ -27,7 +33,7 @@ export save_experiment_results, load_experiment_results
     include(joinpath(ROOT_DIR, "src", "wagner_algorithm.jl"))
     using .BooleanNetwork
     include(joinpath(ROOT_DIR, "src", "data_processing.jl"))
-    using .CustomStats
+    using .CustomStats # obtains population-level statistics
 
     # Make sure PyCall can import motif_search.py that lives under src/.
     const PY_SRC_PATH = joinpath(ROOT_DIR, "src")
@@ -50,7 +56,7 @@ export save_experiment_results, load_experiment_results
         distribution::Distribution
     end
 
-    Base.@kwdef struct Experiment1Config
+    Base.@kwdef struct Experiment1Config #TODO - replace with a "loader" in each experiment
         generations::Int = 500 # 500
         pop_size::Int = 300 # 300
         mode::String = "stable"
@@ -60,15 +66,10 @@ export save_experiment_results, load_experiment_results
         robustness_n_noise_masks::Int = 30
         standard_noise::Distribution = Gamma(1.0,1.0)
         N_target::Int = 10
+        # TODO - incorporate type of initial network topology and connectivity
     end
 
-    Base.@kwdef struct Experiment2Config
-        trials::Int = 30 # 30
-        max_loop_size::Int = 5 # 5
-        sample_size::Int = 30 # 30
-    end
-
-    struct PopulationRobustnessSummary
+    struct PopulationRobustnessSummary # TODO - revise with theoretical discussion in methods section
         stable_expression_shift_population::Matrix{Float64}
         stable_expression_variance_population::Matrix{Float64}
         unstable_probability_shift_population::Matrix{Float64}
@@ -77,15 +78,26 @@ export save_experiment_results, load_experiment_results
 
     struct Experiment1Result
         scenarios::Vector{NoiseScenario}
-        averages::Dict{Symbol, Matrix{Float64}}
-        sems::Dict{Symbol, Matrix{Float64}}
+        averages::Dict{Symbol,Matrix{Float64}}
+        sems::Dict{Symbol,Matrix{Float64}} # TODO - replace with standard deviations
         final_alignments::Matrix{Float64}
         initial_robustness::PopulationRobustnessSummary
         final_robustness::PopulationRobustnessSummary
+        #TODO - add samples of matrices from populations in the generation
         config::Experiment1Config
     end
 
-    struct MotifStats
+    # ------------------------------------------------------------------
+    # Experiment 2 helpers
+    # ------------------------------------------------------------------
+
+    Base.@kwdef struct Experiment2Config
+        trials::Int = 30 # 30
+        max_loop_size::Int = 5 # 5
+        sample_size::Int = 30 # 30
+    end
+
+    struct MotifStats # TODO - revise with motif-search algorithms
         ffl::Dict{String, Vector{Float64}}
         fbcks_reinf::Dict{Int, Vector{Float64}}
         fbcks_balanc::Dict{Int, Vector{Float64}}
@@ -98,6 +110,11 @@ export save_experiment_results, load_experiment_results
         config::Experiment2Config
     end
 
+    # ------------------------------------------------------------------
+    # General functions
+    # ------------------------------------------------------------------
+
+
     function build_noise_scenarios(config::Experiment1Config)
         scenarios = NoiseScenario[NoiseScenario("Noiseless", 0.0, Bernoulli(1.0))]
         append!(
@@ -107,7 +124,7 @@ export save_experiment_results, load_experiment_results
         return scenarios
     end
 
-    function mean_path_length(row) # This function should already be handled in CustomStats
+    function mean_path_length(row) # TODO - This function should already be handled in CustomStats
         values = Float64[]
         for val in row
             if val === nothing || (val isa Missing)
@@ -141,7 +158,20 @@ export save_experiment_results, load_experiment_results
         return means, sems
     end
 
+    """
+        run_experiment1(config::Experiment1Config)
+
+    Run the first experiment of the model. 
+    It subjects populations to various levels of noise throughout evolution.
+    It records the average and standard deviation of population's fitness,
+    path length, completion percentages, alignment score, and computes
+    the mutational robustness tuple (initial expression shift, initial unstable shift,
+    final expression shift, initial unstable shift)
+    """
     function run_experiment1(config::Experiment1Config)
+
+        # TODO - Add loader of configuration 
+
         params = deepcopy(BooleanNetwork.STANDARD_PARAMETERS)
         params["G"] = config.generations
         params["pop_size"] = config.pop_size
@@ -149,6 +179,7 @@ export save_experiment_results, load_experiment_results
         params["N_target"] = config.N_target
 
 
+        # Pre-allocate variables to hold data
         scenarios = build_noise_scenarios(config)
         gens = params["G"]
         metric_names = (:fit, :path, :completion, :alignment)
@@ -166,7 +197,6 @@ export save_experiment_results, load_experiment_results
         final_prob_expr_shift = zeros(length(scenarios), config.trials)
         final_prob_expr_var = zeros(length(scenarios), config.trials)
 
-
         progress = Progress(length(scenarios); desc="Experiment 1 – noise schedules")
         for (noise_idx, scenario) in enumerate(scenarios)
             all_fit = zeros(config.trials, gens)
@@ -174,13 +204,15 @@ export save_experiment_results, load_experiment_results
             all_completion = zeros(config.trials, gens)
             all_alignment = zeros(config.trials, gens)
 
-            @threads for trial_idx in 1:config.trials
+          # Run experiments in parallel
+            @threads for trial_idx in 1:config.trials 
+                # local parameter selection
                 local_params = deepcopy(params)
-                local_params["noise_dist"] = scenario.distribution
-                local_params = deepcopy(params)
-                local_params["noise_dist"] = scenario.distribution
+                local_params["noise_dist"] = scenario.distribution 
 
-                exp_data = BooleanNetwork.run_simulation(local_params)
+                exp_data = BooleanNetwork.run_simulation(local_params) # Experiment results
+
+                # extract and compute metrics
                 fitness_run = exp_data["fitness"]
                 path_length_run = exp_data["path_length"]
                 completion = Float64.(exp_data["completion"])
@@ -189,6 +221,7 @@ export save_experiment_results, load_experiment_results
                     exp_data["phenotypic_optima"]
                 )
 
+                # TODO - Factorize into functions that can be tested
                 avg_fit = vec(mean(fitness_run, dims=2))
                 avg_alignment = vec(mean(alignments, dims=2))
                 path_means = map(mean_path_length, eachrow(path_length_run))
@@ -228,6 +261,7 @@ export save_experiment_results, load_experiment_results
                     activation=BooleanNetwork.activation
                 )
 
+                # TODO - Incorporate in a for loop
                 init_stab_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness,:stable_expression_shift))
                 init_stab_expr_var[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :stable_expression_variance))
                 init_prob_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :unstable_probability_shift))
@@ -240,6 +274,7 @@ export save_experiment_results, load_experiment_results
 
             end
 
+            #TODO - Incorporate in a for loop
             means, sem_vals = column_mean_and_sem(all_fit)
             averages[:fit][noise_idx, :] .= means
             sems[:fit][noise_idx, :] .= sem_vals
@@ -255,6 +290,8 @@ export save_experiment_results, load_experiment_results
             means, sem_vals = column_mean_and_sem(all_alignment)
             averages[:alignment][noise_idx, :] .= means
             sems[:alignment][noise_idx, :] .= sem_vals
+
+            #TODO - PRIORITY - Sample some of the matrices here
 
             next!(progress)
         end
@@ -275,11 +312,13 @@ export save_experiment_results, load_experiment_results
     end
 
     function select_matrices(collection, sample_size::Int)
+        # TODO - Remove this function
         limit = min(sample_size, length(collection))
         return [Matrix(collection[i]) for i in 1:limit]
     end
 
     function random_matrix_generator(base_params::Dict, config::Experiment2Config)
+        #TODO - refactor with evolved_matrix_generator into a single function
         function generator()
             phen = sample([1, -1], Weights([base_params["p_phen"], 1 - base_params["p_phen"]]), base_params["N_target"])
             _, _, matrices = BooleanNetwork.initialize_population(
@@ -287,8 +326,8 @@ export save_experiment_results, load_experiment_results
                 BooleanNetwork.make_initial_state,
                 BooleanNetwork.make_optimal_phenotype,
                 BooleanNetwork.activation
-            )
-            return select_matrices(matrices, config.sample_size), phen
+            ) #TODO - confusing function name. 
+            return select_matrices(matrices, config.sample_size), phen # TODO - remove select_amatrices (they are already sorted randomly!)
         end
         return generator
     end
@@ -384,7 +423,7 @@ export save_experiment_results, load_experiment_results
     function run_experiment2(config::Experiment2Config, base_params::Dict, noise_scenarios::Vector{NoiseScenario})
         random_gen = random_matrix_generator(base_params, config)
         noiseless_gen = evolved_matrix_generator(base_params, Bernoulli(1.0), config)
-        noisy_gen = evolved_matrix_generator(base_params, noise_scenarios[end].distribution, config)
+        noisy_gen = evolved_matrix_generator(base_params, noise_scenarios[end].distribution, config) #TODO - require a specific noise value
 
         random_stats = aggregate_motif_statistics(random_gen, config; desc="Random matrices")
         noiseless_stats = aggregate_motif_statistics(noiseless_gen, config; desc="Noiseless evolution")
@@ -396,6 +435,8 @@ export save_experiment_results, load_experiment_results
     # ------------------------------------------------------------------
     # Serialization helpers (JSON)
     # ------------------------------------------------------------------
+
+    # TODO - Can I avoid the JSON altogheter with JDL2?
 
     const GAMMA_ALPHA_KEYS = ("alpha", "shape", "k", "α", "Чс")
     const GAMMA_THETA_KEYS = ("theta", "scale", "θ", "Чч")
@@ -482,17 +523,18 @@ export save_experiment_results, load_experiment_results
         return result
     end
 
-    # ------------------------------------------------------------------
-    # Save/load helpers
-    # ------------------------------------------------------------------
+    # # ------------------------------------------------------------------
+    # # Save/load helpers
+    # # ------------------------------------------------------------------
 
-    function save_experiment_results(path::AbstractString, result)
-        JSON3.write(path, result)
-        return nothing
-    end
+    # function save_experiment_results(path::AbstractString, result)
+    #     # TODO - Remove. They will be handled via JLD2
+    #     JSON3.write(path, result)
+    #     return nothing
+    # end
 
-    function load_experiment_results(path::AbstractString, ::Type{T}) where {T}
-        return JSON3.read(read(path, String), T)
-    end
+    # function load_experiment_results(path::AbstractString, ::Type{T}) where {T}
+    #     return JSON3.read(read(path, String), T)
+    # end
 
 end # module

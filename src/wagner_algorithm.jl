@@ -33,9 +33,9 @@ export run_simulation
     # Fields
     - `generations::Int`: Total number of evolutionary generations to simulate. 
     - `initial_density::Float64`: Initial connectivity density of networks in the population.
-    - `initial_pop_type::String`: Initial population state strategy (e.g., `"stable"`).
-    - `max_steps::Int`: Maximum steps per generation/individual evaluation. 
-    - `noise_dist::X`: Probability distribution for environmental/expression noise. 
+    - `initial_pop_type::String`: Initial population stability.
+    - `max_steps::Int`: Maximum steps in phenotype expression.
+    - `noise_dist::X`: Probability distribution for interaction strength noise. 
     - `number_genes::Int`: Number of genes per regulatory network. 
     - `pop_size::Int`: Number of individuals in the population. 
     - `selection_pressure::Float64`: Scaling factor determining selection intensity.
@@ -45,7 +45,6 @@ export run_simulation
     # TODO
     - add regulatory genes, which are not directly under selective pressure
     - add development mode (a string containing synchronous or asynchronous)
-    - 
     """
     @kwdef mutable struct SimulationParameters{W<:Distribution,X<:Distribution}
         generations::Int = 500

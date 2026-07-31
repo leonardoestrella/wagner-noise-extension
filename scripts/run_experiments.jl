@@ -79,7 +79,9 @@ export save_experiment_results, load_experiment_results
     struct Experiment1Result
         scenarios::Vector{NoiseScenario}
         averages::Dict{Symbol,Matrix{Float64}}
-        sems::Dict{Symbol,Matrix{Float64}} # TODO - replace with standard deviations
+        sems::Dict{Symbol,Matrix{Float64}}
+        stds::Dict{Symbol,Matrix{Float64}}
+        sizes::Dict{Symbol,Matrix{Float64}}
         final_alignments::Matrix{Float64}
         initial_robustness::PopulationRobustnessSummary
         final_robustness::PopulationRobustnessSummary
@@ -139,23 +141,40 @@ export save_experiment_results, load_experiment_results
         return isempty(values) ? NaN : mean(values)
     end
 
-    function column_mean_and_sem(data::Matrix{Float64}) # This function should already be handled in Custom Stats
+    """
+        function column_mean_and_stds
+    
+    computes the mean and standard deviation per column in a data matrix. it ignores
+    the entries with missing values, and counts the number of non-missing values.
+            (THIS MIGHT BE THE SOURCE OF ERROR FOR θ=1.00)
+
+    args
+        - data: a matrix with numerical values
+    returns
+        - means: a vector with the averages
+        - means: a vector with the standard deviations
+        - sizes: a vector with the number of non-missing values per column
+    """
+    # previously: column_mean_and_sem #TODO - remove this comment
+    function column_mean_and_stds(data::Matrix{Float64}) # This function should already be handled in Custom Stats
         cols = size(data, 2)
         means = Vector{Float64}(undef, cols)
-        sems = Vector{Float64}(undef, cols)
+        stds = Vector{Float64}(undef, cols)
+        sizes = Vector{Float64}(undef, cols)
         for col in 1:cols
             col_data = view(data, :, col)
             mask = .!isnan.(col_data)
             clean = col_data[mask]
             if isempty(clean)
                 means[col] = NaN
-                sems[col] = NaN
+                stds[col] = NaN
             else
                 means[col] = mean(clean)
-                sems[col] = std(clean) / sqrt(length(clean))
+                stds[col] = std(clean) 
+                sizes[col] = length(clean)
             end
         end
-        return means, sems
+        return means, stds, sizes
     end
 
     """
@@ -185,6 +204,10 @@ export save_experiment_results, load_experiment_results
         metric_names = (:fit, :path, :completion, :alignment)
         averages = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
         sems = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
+
+        stds = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
+        sizes = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
+
         final_alignments = zeros(length(scenarios), config.trials)
 
         init_stab_expr_shift = zeros(length(scenarios), config.trials)
@@ -274,22 +297,20 @@ export save_experiment_results, load_experiment_results
 
             end
 
-            #TODO - Incorporate in a for loop
-            means, sem_vals = column_mean_and_sem(all_fit)
-            averages[:fit][noise_idx, :] .= means
-            sems[:fit][noise_idx, :] .= sem_vals
+            metric_data = Dict(
+                :fit => all_fit,
+                :path => all_path,
+                :completion => all_completion,
+                :alignment => all_alignment,
+            )
 
-            means, sem_vals = column_mean_and_sem(all_path)
-            averages[:path][noise_idx, :] .= means
-            sems[:path][noise_idx, :] .= sem_vals
-
-            means, sem_vals = column_mean_and_sem(all_completion)
-            averages[:completion][noise_idx, :] .= means
-            sems[:completion][noise_idx, :] .= sem_vals
-
-            means, sem_vals = column_mean_and_sem(all_alignment)
-            averages[:alignment][noise_idx, :] .= means
-            sems[:alignment][noise_idx, :] .= sem_vals
+            for metric in (:fit, :path, :completion, :alignment)
+                local_avg, local_std, local_sizes = column_mean_and_stds(metric_data[metric])
+                averages[metric][noise_idx, :] .= local_avg
+                sems[metric][noise_idx, :] .= local_std ./ sqrt.(local_sizes)
+                stds[metric][noise_idx, :] .= local_std
+                sizes[metric][noise_idx, :] .= local_sizes
+            end
 
             #TODO - PRIORITY - Sample some of the matrices here
 
@@ -298,7 +319,7 @@ export save_experiment_results, load_experiment_results
 
         initial_summary = PopulationRobustnessSummary(init_stab_expr_shift, init_stab_expr_var, init_prob_expr_shift, init_prob_expr_var)
         final_summary = PopulationRobustnessSummary(final_stab_expr_shift, final_stab_expr_var, final_prob_expr_shift, final_prob_expr_var)
-        return Experiment1Result(scenarios, averages, sems, final_alignments, initial_summary, final_summary, config)
+        return Experiment1Result(scenarios, averages, sems, stds, sizes, final_alignments, initial_summary, final_summary, config)
     end
 
     # ------------------------------------------------------------------

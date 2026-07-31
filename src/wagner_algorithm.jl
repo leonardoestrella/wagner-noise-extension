@@ -1,71 +1,63 @@
 """
-BooleanNetwork
+    BooleanNetwork
 
-A module implementing Wagner's GRN evolution algorithm with noise extensions.
-This implementation focuses on memory efficiency and performance while maintaining
-the exact evolutionary dynamics of the original algorithm.
+Provides tools and structures to run an evolutionary algorithm of gene-regulatory networks
+
+# Exported functions
+
+- `run_simulation`: Executes a single simulation run with a given set of parameters
 """
 module BooleanNetwork
 
-using LinearAlgebra
-using Random
 using Distributions
+using LinearAlgebra
 using Parameters
+using Random
 using StatsBase
+
+using Base: @kwdef
 
 export run_simulation
 
-# Type aliases for improved performance and code clarity
-const NetworkMatrix = Matrix{Float64}    # Weight matrix type
-const GeneState = Union{Vector{Int64}, Vector{Float64}}         # Gene expression state type
-const Population = Vector{NetworkMatrix} # Collection of networks
-const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution{Univariate,Discrete}} # Distribution for noise
-
     """
     --------------------
-    STANDARD PARAMETERS
+    UTILITIES
     --------------------
     """
 
-    const STANDARD_PARAMETERS = Dict{String,Any}(
-        "G" => 500, # Number of generations per run (500)
-        "max_steps" => 100, # Maximum number of steps before declaring a state unstable
-        "s" => 10, # selection pressure
-        "unstable_fitness" => exp(-10), # fitness for unstable matrices
-        "mode" => "stable", # initialization mode 
-        "pop_size" => 300, # 300
-        "N_target" => 10, # Number of target genes
-        "N_regulator" => 0, # Number of non-target genes (not used, yet)
-        "c" => 1.0, # initial matrix density
-        "p_init" => 0.5, # proportion of +1 in initial gene expression state
-        "p_phen" => 0.5, # proportion of +1 in target optimal phenotype
-        "mr" => 0.0,"σr" => 1.0, # weights distribution parameters
-        "pr" => 0.01, # regular mutation probability
-        "pc" => 0.0, # connectivity mutation probability (deprecated)
-        "p_rec" => 0.5, # 0 for no recombination, 0.5 for unbiased recombination
-        "noise_prob" => 1.0, # probability of each weight to be affected by noise
-        "noise_dist" => Bernoulli(1.0) # no noise
-    )
-
     """
-    --------------------
-    DYNAMICS
-    -------------------
+        SimulationParameters
+
+    Holds configuration settings and initial conditions for a simulation run.
+
+    # Fields
+    - `generations::Int`: Total number of evolutionary generations to simulate. 
+    - `initial_density::Float64`: Initial connectivity density of networks in the population.
+    - `initial_pop_type::String`: Initial population state strategy (e.g., `"stable"`).
+    - `max_steps::Int`: Maximum steps per generation/individual evaluation. 
+    - `noise_dist::X`: Probability distribution for environmental/expression noise. 
+    - `number_genes::Int`: Number of genes per regulatory network. 
+    - `pop_size::Int`: Number of individuals in the population. 
+    - `selection_pressure::Float64`: Scaling factor determining selection intensity.
+    - `unstable_fitness::Float64`: Baseline fitness assigned to unstable network states.
+    - `weights_dist::W`: Probability distribution used to sample edge weights. 
+
+    # TODO
+    - add regulatory genes, which are not directly under selective pressure
+    - add development mode (a string containing synchronous or asynchronous)
+    - 
     """
-
-    """
-        activation(x::AbstractVecOrMat{<:Real}) -> AbstractVecOrMat{Float64}
-
-    Vectorized activation function that converts continuous values to discrete states {-1,1}.
-
-    # Arguments
-    - `x`: Input vector or matrix of real numbers
-
-    # Returns
-    - Vector or matrix of same shape as input with values ∈ {-1.0, 1.0}
-    """
-    function activation(x)
-        return sign.(x)
+    @kwdef mutable struct SimulationParameters{W<:Distribution,X<:Distribution}
+        generations::Int = 500
+        initial_density::Float64 = 1.0
+        initial_pop_type::String = "stable"
+        max_steps::Int = 100
+        noise_dist::X = Bernoulli(1.0)  # standard is no noise
+        number_genes::Int = 10
+        pop_size::Int = 300
+        selection_pressure::Float64 = 10.0
+        unstable_fitness::Float64 = exp(-10.0)
+        weights_dist::W = Normal(0.0, 1.0)
     end
 
     """
@@ -74,453 +66,249 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
     Compute normalized Hamming distance between two gene state vectors.
 
     # Arguments
-    - `v1`, `v2`: Vectors containing gene states (1 or -1)
-    - `N_target`: Number of target genes to consider
+    - `v1::AbstractVector`: First vector containing gene states (typically values in {-1, 1}).
+    - `v2::AbstractVector`: Second vector containing gene states.
 
     # Returns
-    - Normalized distance in [0,1] where 0 means identical and 1 means opposite
+    - `Float64`: Normalized distance in [0,1] where 0 means identical and 1 means opposite
+
+    # Throws
+    - `DimensionMismatch`: If vectors are of different size
     """
-    function hamming_distance(v1::AbstractVector, v2::AbstractVector, N_target::Integer)
-        @assert length(v1) >= N_target && length(v2) >= N_target "Vectors must be at least N_target long"
-        # Use views to avoid allocation and enable SIMD
-        v1_view = @view v1[1:N_target]
-        v2_view = @view v2[1:N_target]
-        # Vectorized dot product
-        matching_genes = dot(v1_view, v2_view)
-        return (N_target - matching_genes) / (2 * N_target)
+    function hamming_distance(v1::AbstractVector, v2::AbstractVector)::Float64
+        length(v1) == length(v2) || 
+            throw(DimensionMismatch("v1 and v2 must be the same size!"))
+        size_vectors = length(v1)
+        matching_genes = dot(v1, v2)
+        return (size_vectors - matching_genes) / (2 * N_target)
     end
 
     """
-        develop(W::NetworkMatrix, 
-                initial_state::GeneState, 
-                max_steps::Integer,
-                activation::Function;
-                buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1)),
-                buffer2::Vector{Float64}=Vector{Float64}(undef, size(W,1))
-                ) -> Tuple{Union{Vector{Float64},Nothing}, Union{Int,Nothing}}
-
-    Develop network phenotype through iterative matrix multiplication until stability
-    or max_steps reached. 
-
+        develop(W::Matrix{<:Real}, initial_state::Vector{<:Real}, max_steps::Int;
+            buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1)),
+            buffer2::Vector{Float64}=Vector{Float64}(undef, size(W,1))
+        ) -> Tuple{Union{Vector{Float64},Nothing}, Union{Int,Nothing}}
+    
+    Develop a network phenotype by iterating `state -> sign.(W * state)` from
+    `initial_state`. Halts as soon as a fixed point is reached, a previously visited state 
+    recurs (indicating a limit cycle), or `max_steps` iterations have elapsed.
+    
     # Arguments
-    - `W`: Weight matrix of the network
-    - `initial_state`: Initial gene expression state
-    - `max_steps`: Maximum iterations before declaring instability
-    - `activation`: Activation function to apply at each step
-    - `buffer1`, `buffer2`: Pre-allocated buffers for intermediate states
-
+    - `W`: gene interaction matrix of the network; assumed square.
+    - `initial_state`: initial gene expression state, of length `size(W, 1)`.
+    - `max_steps`: maximum number of iterations attempted before the state is
+        declared unstable.
+    
+    # Keywords
+    - `buffer1`, `buffer2`: pre-allocated, length-`size(W,1)` buffers used to hold
+        intermediate states. Repeated calls avoid reallocating the state vector each time.
+    
     # Returns
-    - Tuple of (final_state, steps_taken) or (nothing, nothing) if unstable
+    - `(final_state, steps_taken)` if a fixed point was reached. 
+    - `(nothing, nothing)` if a cycle was detected or `max_steps` was exhausted
+        without stabilizing.
 
+    # Throws
+    - `DimensionMismatch` if W is not square, has a different number of columns than
+        the size of initial_state, or the buffers do not have the same size as initial_state.
+    
+    # TODO
+    - Add asynchronous development possibility
+    - Add the possibility of other activation functions
+    - Optimize cycle finding algorithm. It currently holds the entire history
     """
-    function develop(W::NetworkMatrix,
-                    initial_state::GeneState,
-                    max_steps::Integer,
-                    activation::Function;
-                    buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1)),
-                    buffer2::Vector{Float64}=Vector{Float64}(undef, size(W,1)))
-        
-        # Initialize buffers with initial state
-        copyto!(buffer1, float.(initial_state))
-        
-        # First iteration
-        mul!(buffer2, W, buffer1)  # In-place matrix multiplication
-        buffer2 .= activation(buffer2)  # In-place activation
-        
-        # Iterate until stability or max_steps
-        for step in 1:max_steps
-            if buffer1 == buffer2
-                return buffer2, step
+    function develop(
+        W::Matrix{<:Real},
+        initial_state::Vector{<:Real},
+        max_steps::Int;
+        buffer1::Vector{Float64}=Vector{Float64}(undef, size(W, 1)),
+        buffer2::Vector{Float64}=Vector{Float64}(undef, size(W, 1))
+    )::Tuple{Union{Vector{Float64},Nothing},Union{Int,Nothing}} 
+        n = size(W, 1)
+        size(W, 2) == n ||
+            throw(DimensionMismatch("W must be square"))
+        length(initial_state) == n ||
+            throw(DimensionMismatch("initial_state must have length size(W, 1)"))
+        (length(buffer1) == n && length(buffer2) == n) ||
+            throw(DimensionMismatch("buffer1 and buffer2 must have length size(W, 1)"))
+
+        buffer1 .= initial_state
+
+        visited_states = Dict{Vector{Float64},Int}()
+        sizehint!(visited_states, max_steps + 1)
+        visited_states[copy(buffer1)] = 0 
+
+        for step in 0:max_steps 
+            mul!(buffer2, W, buffer1)  # in-place matrix multiplication
+            buffer2 .= sign.(buffer2)  # in-place activation
+
+            if buffer2 == buffer1
+                return (copy(buffer2), step)  # fixed point reached in `step` iterations
             end
-            buffer1, buffer2 = buffer2, buffer1  # Swap buffers
-            mul!(buffer2, W, buffer1)  # In-place matrix multiplication
-            buffer2 .= activation(buffer2)  # In-place activation
+            if haskey(visited_states, buffer2)
+                return (nothing, nothing)  # limit cycle detected
+            end
+            visited_states[copy(buffer2)] = step  # copy: buffer2 will be overwritten later
+
+            buffer1, buffer2 = buffer2, buffer1  # swap roles for the next iteration
         end
-        
-        return nothing, nothing
+
+        return (nothing, nothing)  # did not stabilize within max_steps
     end
     
     """
-        develop_asynchronous(
-            W::NetworkMatrix,
-            initial_state::GeneState,
-            max_steps::Integer,
-            activation::Function;
-            buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1))
-        ) -> Tuple{Union{Vector{Float64},Nothing}, Union{Int,Nothing}}
+        apply_noise!(W::Matrix{<:Real}, noise_dist::Distribution) -> Nothing
 
-    Develop network phenotype via **asynchronous** (gene-by-gene) updates until a
-    full sweep produces no changes or `max_steps` sweeps are reached.
-
-    # Arguments
-    - `W`: Weight matrix (Ng × Ng)
-    - `initial_state`: Initial gene expression state (length Ng)
-    - `max_steps`: Maximum number of full sweeps
-    - `activation`: Maps the weighted input of a gene to its next value (e.g., `sign`, `tanh`, etc.)
-    - `buffer1`: Pre-allocated buffer holding the evolving state
-
-    # Returns
-    - `(final_state, sweeps_taken)` if stabilized, else `(nothing, nothing)`
-    """
-    function develop_asynchronous(
-        W::NetworkMatrix,
-        initial_state::GeneState,
-        max_steps::Integer,
-        activation::Function;
-        buffer1::Vector{Float64}=Vector{Float64}(undef, size(W, 1))
-    )::Tuple{Union{Vector{Float64},Nothing},Union{Int,Nothing}}
-
-        Ng = size(W, 1)
-        @assert size(W, 2) == Ng "W must be square (Ng×Ng)."
-        @assert length(initial_state) == Ng "initial_state must have length Ng."
-        @assert length(buffer1) == Ng "buffer1 must have length Ng."
-
-        # initialize state
-        copyto!(buffer1, Float64.(initial_state))
-
-        for sweep in 1:max_steps
-            changed = false
-
-            # update each gene using the latest state (asynchronous)
-            @inbounds for i in 1:Ng
-                input = dot(view(W, i, :), buffer1)
-                newval = activation(input)
-
-                if newval != buffer1[i]
-                    buffer1[i] = newval
-                    changed = true
-                end
-            end
-
-            # no gene state changed in the last sweep, return the state
-            if !changed
-                return buffer1, sweep
-            end
-        end
-
-        return nothing, nothing
-    end
-
-    """
-        apply_noise!(W::NetworkMatrix, 
-                    noise_prob::Float64, 
-                    noise_dist::NoiseDistribution) -> Nothing
-
-    Apply multiplicative noise to nonzero elements of the weight matrix.
-    Optimized to minimize memory allocations and maximize vectorization.
+    Apply noise to a weight matrix. It alters the input to recycle objects instead of 
+    creating new ones.
 
     # Arguments
     - `W`: Weight matrix to modify
-    - `noise_prob`: Probability of applying noise to each nonzero element
-    - `noise_dist`: Distribution to sample noise values from (E[η] ≈ 1)
+    - `noise_dist`: Distribution to sample noise values
     """
-    function apply_noise!(W::NetworkMatrix, 
-                        noise_prob::Float64, 
-                        noise_dist::NoiseDistribution)
-        # Early exit if no noise
-        if noise_prob == 0.0
-            return nothing
-        end
-        
-        # Find nonzero elements
-        nonzero_idxs = findall(!iszero, W)
-        if isempty(nonzero_idxs)
-            return nothing
-        end
-        
-        n_elements = length(nonzero_idxs)
-
-        # Optimize the common special-case where every nonzero element is affected
-        if noise_prob >= 1.0
-            noise_values = rand(noise_dist, n_elements)
-            W[nonzero_idxs] .*= noise_values
+    function apply_noise!(W::Matrix{<:Real},noise_dist::Distribution)::Nothing
+        if noise_dist isa Bernoulli && params(noise_dist)[1] == 1.0 # early exit if no noise
             return nothing
         end
 
-        # For partial-noise probability, generate boolean mask then apply only
-        # to the selected subset to reduce unnecessary random draws.
-        apply_noise = rand(n_elements) .< noise_prob
-        if any(apply_noise)
-            noise_values = rand(noise_dist, count(apply_noise))
-            W[nonzero_idxs[apply_noise]] .*= noise_values
-        end
-        
+        noise_matrix = rand(noise_dist,size(W))
+        W = W.*noise_matrix # apply noise directly
+
         return nothing
     end
 
     """
-    --------------------
-    INITIALIZATION
-    --------------------
-    """
+        generate_random_matrix(
+            number_genes::Int,noise_dist::Distribution,density<:Real
+        ) -> Matrix{Float64}
 
-    """
-        generate_random_matrix(N::Integer, mr::Real, σr::Real, c::Real) -> Matrix{Float64}
-
-    Generate a random weight matrix for a gene regulatory network.
-    
-    # Arguments
-    - `N`: Matrix dimensions (N × N)
-    - `mr`: Mean of the normal distribution for weights
-    - `σr`: Standard deviation of the normal distribution for weights
-    - `c`: Connection probability (controls sparsity)
-    
-    # Returns
-    - An N × N matrix with weights drawn from Normal(mr, σr) and masked by Bernoulli(c)
-    """
-    function generate_random_matrix(N::Integer, mr::Real, σr::Real, c::Real)::Matrix{Float64}
-        # Pre-allocate result matrix
-        result = zeros(Float64, N, N)
-        
-        # Cache distributions for repeated use
-        norm_dist = Normal(mr, σr)
-        
-        # Generate all weights at once
-        n_elements = N * N
-        active_elements = rand(n_elements) .< c
-        n_active = count(active_elements)
-        
-        if n_active > 0
-            # Only generate random weights for active connections
-            active_weights = rand(norm_dist, n_active)
-            
-            # Place weights in active positions
-            result[active_elements] .= active_weights
-        end
-        
-        return result
-    end
-
-    """
-        check_stability(W::NetworkMatrix,
-                    initial_state::GeneState,
-                    max_steps::Integer,
-                    activation::Function;
-                    buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1)),
-                    buffer2::Vector{Float64}=Vector{Float64}(undef, size(W,1))
-                    ) -> Tuple{Bool, Union{Vector{Float64}, Nothing}, Union{Int, Nothing}}
-
-    Check if a network reaches a stable state within max_steps.
+    Generate a random gene regulatory matrix with a specified connection density.
+    Matrix entries are sampled from `noise_dist`, and each entry is independently
+    retained with probability `density` or set to zero otherwise.
 
     # Arguments
-    - `W`: Weight matrix to check
-    - `initial_state`: Initial state vector
-    - `max_steps`: Maximum steps before declaring instability
-    - `activation`: Activation function to use
-    - `buffer1`, `buffer2`: Pre-allocated buffers for development
+    - `number_genes`: Number of genes
+    - `noise_dist`: Distribution used to sample nonzero interaction strengths
+    - `density`: Probability that a given interaction is present (must be between 0 and 1)
 
     # Returns
-    - Tuple of:
-        1. Boolean indicating stability
-        2. Final phenotype (or nothing if unstable)
-        3. Steps taken (or nothing if unstable)
+    - A `number_genes × number_genes` matrix whose entries are sampled from
+    `noise_dist` and masked by a Bernoulli adjacency matrix with parameter
+    `density`.
 
+    # Throws
+    - `DomainError` if the density of the matrix is not between 0.0 and 1.0
+
+    # TODO
+    - Add ability to specify a topology (or create new functions to choose topologies)
     """
-    function check_stability(W::NetworkMatrix,
-                           initial_state::GeneState,
-                           max_steps::Integer,
-                           activation::Function;
-                           buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1)),
-                           buffer2::Vector{Float64}=Vector{Float64}(undef, size(W,1))
-                           )::Tuple{Bool, Union{Vector{Float64}, Nothing}, Union{Int, Nothing}}
-        phenotype, steps = develop(W, initial_state, max_steps, activation; 
-                                 buffer1=buffer1, buffer2=buffer2)
-        # phenotype, steps = develop_asynchronous(W, initial_state, max_steps, activation; 
-        #                          buffer1=buffer1)
-        return phenotype !== nothing, phenotype, steps
-    end
-
-
-    """
-        sample_binary_state(N::Int, p::Real) -> Vector{Int}
-
-    Generic helper that returns a length-N vector with entries in {1, -1}.
-    The value 1 is sampled with probability p and -1 with probability 1-p.
-
-    This is the single implementation used by both `make_initial_state`
-    and `make_optimal_phenotype` to avoid duplication.
-    """
-    function sample_binary_state(N::Int, p::Real)::Vector{Int}
-        # Use small pre-allocated arrays for values and weights to avoid repeated allocations
-        vals = [1, -1]
-        w = Weights([p, 1 - p])
-        return sample(vals, w, N)
-    end
-
-
-    """
-        make_initial_state(params::Dict) -> Vector{Int}
-
-    Wrapper around `sample_binary_state` using parameters in `params`.
-    """
-    function make_initial_state(params::Dict)
-        N = params["N_target"] + params["N_regulator"]
-        p_init = params["p_init"]
-        return sample_binary_state(N, p_init)
+    function generate_random_matrix(
+        number_genes::Int, noise_dist::Distribution, density::Real
+        )::Matrix{Float64}
+        0.0 <= density <= 1.0 ||
+            throw(DomainError("density must be between 0.0 and 1.0, got $density"))
+        adjacency = Bernoulli(density) 
+        return rand(noise_dist, (number_genes,number_genes)) .* rand(adjacency,(number_genes,number_genes))
     end
 
     """
-        make_optimal_phenotype(params::Dict) -> Vector{Int}
-
-    Wrapper around `sample_binary_state` using parameters in `params`.
-    """
-    function make_optimal_phenotype(params::Dict)
-        N_target = params["N_target"]
-        p_phen = params["p_phen"]
-        return sample_binary_state(N_target, p_phen)
-    end
-
-    """
-        initialize_population(params::Dict,
-                            initial_state_generator::Function,
-                            optimal_phen_generator::Function,
-                            activation::Function
-                            ) -> Tuple{GeneState, GeneState, Vector{Matrix{Float64}}}
+        initialize_population(params::Dict
+        ) -> Tuple{Vector{Float64}, Vector{Float64}, Vector{Matrix{Float64}}}
 
     Initialize a population of gene regulatory networks according to specified mode.
     Uses pre-allocated buffers and optimized matrix generation.
 
     # Arguments
     - `params`: Dictionary of simulation parameters
-    - `initial_state_generator`: Function to generate initial states
-    - `optimal_phen_generator`: Function to generate optimal phenotype
-    - `activation`: Activation function for development
 
     # Returns
     - Tuple of:
         1. Initial state vector
         2. Optimal phenotype vector
         3. Vector of weight matrices
-    """
-    function initialize_population(params::Dict,
-                                initial_state_generator::Function,
-                                optimal_phen_generator::Function,
-                                activation::Function
-                                )::Tuple{GeneState, GeneState, Vector{Matrix{Float64}}}
-        
-        # Extract parameters
-        mode = params["mode"]
-        pop_size = params["pop_size"]
-        N_target = params["N_target"]
-        N_regulator = params["N_regulator"]
-        N = N_target + N_regulator
-        mr = params["mr"]
-        σr = params["σr"]
-        c = params["c"]
-        max_steps = params["max_steps"]
 
-        # Generate states
-        initial_state = initial_state_generator(params)
-        optimal_phenotype = optimal_phen_generator(params)
-        
-        # Pre-allocate development buffers
+    #TODO
+    - Add asynchornous development mode
+    - Add possibility to switch domains [1.0, -1.0] <-> [1.0, 0.0]
+    """
+    function initialize_population(
+        params::SimulationParameters
+        )::Tuple{Vector{Float64}, Vector{Float64}, Vector{Matrix{Float64}}}
+        # ---Constants---
+        initial_state = rand([1.0,-1.0], params.number_genes) 
+        optimal_phenotype = rand([1.0, -1.0], params.number_genes)
+        # TODO - Add possibility of switching [1.0,-1.0] domain to [1.0,0.0]
         buffer1 = Vector{Float64}(undef, N)
         buffer2 = Vector{Float64}(undef, N)
         
-        phenotype = nothing
-
-        if mode == "random"
-            # For random mode, just generate matrices without stability checks
-            matrices = Vector{Matrix{Float64}}(undef, pop_size)
-            for i in 1:pop_size
-                matrices[i] = generate_random_matrix(N, mr, σr, c)
-            end
-            return (initial_state, optimal_phenotype, matrices)
-
-        elseif mode == "stable"
-            matrices = Vector{Matrix{Float64}}(undef, pop_size)
-            
-            # Find stable matrices using pre-allocated buffers
-            for i in 1:pop_size
-                while true
-                    candidate = generate_random_matrix(N, mr, σr, c)
-                    is_stable, phenotype, steps = check_stability(
-                        candidate, initial_state, max_steps, activation;
-                        buffer1=buffer1, buffer2=buffer2
-                    )
-                    
-                    if is_stable
-                        matrices[i] = copy(candidate)
-                        break
-                    end
-                end
-            end
-            return (initial_state, optimal_phenotype, matrices)
-
-        elseif mode == "unstable"
-            matrices = Vector{Matrix{Float64}}(undef, pop_size)
-            
-            # Find unstable matrices using pre-allocated buffers
-            for i in 1:pop_size
-                while true
-                    candidate = generate_random_matrix(N, mr, σr, c)
-                    is_stable, phenotype, steps = check_stability(
-                        candidate, initial_state, max_steps, activation;
-                        buffer1=buffer1, buffer2=buffer2
-                    )
-                    
-                    if !is_stable  # Want unstable matrices here
-                        matrices[i] = copy(candidate)
-                        break
-                    end
-                end
-            end
-            return (initial_state, optimal_phenotype, matrices)
-
-        elseif mode == "optimal clones"
-            matrices = Vector{Matrix{Float64}}(undef, pop_size)
-            
-            # Find a single stable matrix and clone it
+        # ---Useful methods---
+        is_stable(matrix) = isnothing(develop(
+            matrix, initial_state, params.max_steps, buffer1, buffer2)[1])
+        stable_matrix() = begin
             while true
-                candidate = generate_random_matrix(N, mr, σr, c)
-                is_stable, phenotype, steps = check_stability(
-                    candidate, initial_state, max_steps, activation;
-                    buffer1=buffer1, buffer2=buffer2
-                )
-                
-                if is_stable
-                    # Found a stable matrix - clone it for the population
-                    for i in 1:pop_size
-                        matrices[i] = copy(candidate)
-                    end
-                    return (initial_state, phenotype, matrices)  # Return the actual phenotype here
-                end
+                candidate = generate_random_matrix(params.number_genes,
+                    params.noise_dist, params.initial_density)
+                stability_test = is_stable(candidate)
+                stability_test && return candidate
             end
+        end
+        unstable_matrix() = begin
+            while true
+                candidate = generate_random_matrix(params.number_genes,
+                    params.noise_dist, params.initial_density)
+                stability_test = !is_stable(candidate)
+                stability_test && return candidate
+            end
+        end
+
+        # ---Generating populations---
+        if mode == "random"  
+        # No stability checks
+            matrices = [
+                generate_random_matrix(params.number_genes, 
+                    params.noise_dist, params.initial_density) 
+                for _ in 1:pop_size
+            ]
+            return (initial_state, optimal_phenotype, matrices)
+
+        elseif mode == "stable"  
+        # Deterministic development reaches a stable state
+            matrices = [stable_matrix() for _ in 1:pop_size]
+            return (initial_state, optimal_phenotype, matrices)
+
+        elseif mode == "unstable"  
+        # Deterministic development does not reach a stable state
+            matrices = [unstable_matrix() for _ in 1:pop_size]
+            return (initial_state, optimal_phenotype, matrices)
+
+        elseif mode == "optimal clones"  
+        # Find a stable matrix and clone it with its expressed phenotype set as optimal
+            candidate = stable_matrix()
+            expressed_phenotype, _ = develop(candidate, initial_state, params.max_steps;
+                buffer1=buffer1, buffer2=buffer2)
+            matrices = [copy(candidate) for _ in 1:params.pop_size]
+            return (initial_state, expressed_phenotype, matrices)
 
         elseif mode == "nonoptimal clones"
-            matrices = Vector{Matrix{Float64}}(undef, pop_size)
-            
-            # Find a single stable matrix (non-optimal) and clone it
-            while true
-                candidate = generate_random_matrix(N, mr, σr, c)
-                is_stable, phenotype, steps = check_stability(
-                    candidate, initial_state, max_steps, activation;
-                    buffer1=buffer1, buffer2=buffer2
-                )
-                
-                if is_stable
-                    # Found a stable matrix - clone it for the population
-                    for i in 1:pop_size
-                        matrices[i] = copy(candidate)
-                    end
-                    return (initial_state, optimal_phenotype, matrices)
-                end
-            end
+        # Find a stable matrix and clone it. The expressed phenotype is not necessarily optimal
+            candidate = stable_matrix()
+            matrices = [copy(candidate) for _ in 1:params.pop_size]
+            return (initial_state, optimal_phenotype, matrices)
 
         elseif mode == "ensemble sample"
+        # Find many matrices in which the expressed phenotype is optimal
             matrices = Vector{Matrix{Float64}}(undef, pop_size)
             population_count = 0
             attempts = 0
-            attempt_limit = 5 * 2^(2*N)  # Max attempts before restart
+            attempt_limit = 5 * 2^(2*params.number_genes)  # Max attempts before restart (Wagner, 1996)
             
             while population_count < pop_size
-                candidate = generate_random_matrix(N, mr, σr, c)
-                is_stable, phenotype, steps = check_stability(
-                    candidate, initial_state, max_steps, activation;
-                    buffer1=buffer1, buffer2=buffer2
-                )
-                
-                if is_stable && phenotype == optimal_phenotype
+                candidate = generate_random_matrix(params.number_genes, 
+                    params.noise_dist, params.initial_density)
+                phenotype, _ = develop(candidate, initial_state, params.max_steps;
+                buffer1=buffer1, buffer2=buffer2)
+
+                if !isnothing(phenotype) && phenotype == optimal_phenotype
                     # Found a matrix with the desired phenotype
                     population_count += 1
                     matrices[population_count] = candidate
@@ -529,12 +317,11 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
                     attempts += 1
                 end
                 
-                # Reset if we've tried too many times
-                if attempts > attempt_limit
+                if attempts > attempt_limit  # Reset if we've tried too many times
                     population_count = 0
                     attempts = 0
-                    initial_state = initial_state_generator(params)
-                    optimal_phenotype = optimal_phen_generator(params)
+                    initial_state = rand([1.0, -1.0], params.number_genes)
+                    optimal_phenotype = rand([1.0, -1.0], params.number_genes)
                 end
             end
             
@@ -543,6 +330,8 @@ const NoiseDistribution = Union{Distribution{Univariate,Continuous},Distribution
             error("Unknown mode: $mode")
         end 
     end
+
+    # Progress Mark - July 31, 2026
 
     """
     -----------------

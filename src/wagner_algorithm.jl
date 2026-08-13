@@ -5,6 +5,7 @@ Provides tools and structures to run an evolutionary algorithm of gene-regulator
 
 # Exported structures and functions
 - `SimulationParameters`: Holds the parameters of the simulation. See # Fields
+- `SimulationData`: The results of a simulation. 
 
 - `run_simulation`: Executes a single simulation run with a given set of parameters
 
@@ -28,8 +29,8 @@ using Base: @kwdef
 export SimulationParameters, SimulationData
 export run_simulation
 
-const valid_initial_pop_types = ["random", "stable", "unstable", "optimal clones",
-    "nonoptimal clones", "ensemble sample"]
+const valid_initial_pop_types = [:random, :stable, :unstable, :optimal_clones,
+    :nonoptimal_clones, :ensemble_sample]
 const valid_selection_types = [:wagner, :roulette]
 
     """
@@ -65,7 +66,7 @@ const valid_selection_types = [:wagner, :roulette]
     @kwdef mutable struct SimulationParameters{W<:Distribution,X<:Distribution}
         generations::Int = 500
         initial_density::Float64 = 1.0
-        initial_pop_type::String = "stable"
+        initial_pop_type::Symbol = :stable
         max_steps::Int = 100
         mutation_prob::Float64 = 0.01
         noise_dist::X = Bernoulli(1.0)  # standard is no noise
@@ -119,7 +120,7 @@ const valid_selection_types = [:wagner, :roulette]
     # TODO
     - Add regulator genes (not directly selected)
     """
-    mutable struct SimulationData
+    @kwdef mutable struct SimulationData
         completion_history::Vector{Int}
         fitness_history::Matrix{Float64}
         matrices_history::Array{Matrix{Float64}}
@@ -129,7 +130,7 @@ const valid_selection_types = [:wagner, :roulette]
     end
 
     """
-        hamming_distance(v1::AbstractVector, v2::AbstractVector, N_target::Integer) -> Float64
+        hamming_distance(v1::AbstractVector, v2::AbstractVector) -> Float64
 
     Compute normalized Hamming distance between two gene state vectors.
 
@@ -148,7 +149,7 @@ const valid_selection_types = [:wagner, :roulette]
             throw(DimensionMismatch("v1 and v2 must be the same size!"))
         size_vectors = length(v1)
         matching_genes = dot(v1, v2)
-        return (size_vectors - matching_genes) / (2 * N_target)
+        return (size_vectors - matching_genes) / (2 * size_vectors)
     end
 
     """
@@ -240,13 +241,12 @@ const valid_selection_types = [:wagner, :roulette]
         end
 
         noise_matrix = rand(noise_dist, size(W))
-        W = W.*noise_matrix # apply noise directly
-
+        W .*= noise_matrix # apply noise directly
         return nothing
     end
 
     """
-        generate_random_matrix(number_genes::Int, noise_dist::Distribution, density::Float64
+        generate_random_matrix(number_genes::Int, weights_dist::Distribution, density::Float64
         ) -> Matrix{Float64}
 
     Generate a random gene regulatory matrix with a specified connection density.
@@ -255,7 +255,7 @@ const valid_selection_types = [:wagner, :roulette]
 
     # Arguments
     - `number_genes`: Number of genes
-    - `noise_dist`: Distribution used to sample nonzero interaction strengths
+    - `weights_dist`: Distribution used to sample nonzero interaction strengths
     - `density`: Probability that a given interaction is present (must be between 0 and 1)
 
     # Returns
@@ -270,12 +270,14 @@ const valid_selection_types = [:wagner, :roulette]
     - Add ability to specify a topology (or create new functions to choose topologies)
     """
     function generate_random_matrix(
-        number_genes::Int, noise_dist::Distribution, density::Float64
+        number_genes::Int, weights_dist::Distribution, density::Float64
         )::Matrix{Float64}
         0.0 <= density <= 1.0 ||
             throw(DomainError("density must be between 0.0 and 1.0, got $density"))
         adjacency = Bernoulli(density) 
-        return rand(noise_dist, (number_genes,number_genes)) .* rand(adjacency,(number_genes,number_genes))
+        mask_weights = rand(adjacency,(number_genes,number_genes))
+        sample_weights = rand(weights_dist, (number_genes,number_genes))
+        return sample_weights .* mask_weights
     end
 
     """
@@ -312,16 +314,16 @@ const valid_selection_types = [:wagner, :roulette]
         initial_state = rand([1.0,-1.0], params.number_genes) 
         optimal_phenotype = rand([1.0, -1.0], params.number_genes)
         # TODO - Add possibility of switching [1.0,-1.0] domain to [1.0,0.0]
-        buffer1 = Vector{Float64}(undef, N)
-        buffer2 = Vector{Float64}(undef, N)
+        buffer1 = Vector{Float64}(undef, params.number_genes)
+        buffer2 = Vector{Float64}(undef, params.number_genes)
         
         # ---Useful methods---
-        is_stable(matrix) = isnothing(develop(matrix, initial_state, params.max_steps; 
+        is_stable(matrix) = !isnothing(develop(matrix, initial_state, params.max_steps; 
             buffer1=buffer1, buffer2=buffer2)[1])
         stable_matrix() = begin
             while true
                 candidate = generate_random_matrix(params.number_genes,
-                    params.noise_dist, params.initial_density)
+                    params.weights_dist, params.initial_density)
                 stability_test = is_stable(candidate)
                 stability_test && return candidate
             end
@@ -329,33 +331,33 @@ const valid_selection_types = [:wagner, :roulette]
         unstable_matrix() = begin
             while true
                 candidate = generate_random_matrix(params.number_genes,
-                    params.noise_dist, params.initial_density)
+                    params.weights_dist, params.initial_density)
                 stability_test = !is_stable(candidate)
                 stability_test && return candidate
             end
         end
 
         # ---Generating populations---
-        if mode == "random"  
+        if params.initial_pop_type == :random  
         # No stability checks
             matrices = [
                 generate_random_matrix(params.number_genes, 
-                    params.noise_dist, params.initial_density) 
+                    params.weights_dist, params.initial_density) 
                 for _ in 1:pop_size
             ]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif mode == "stable"  
+        elseif params.initial_pop_type == :stable
         # Deterministic development reaches a stable state
-            matrices = [stable_matrix() for _ in 1:pop_size]
+            matrices = [stable_matrix() for _ in 1:params.pop_size]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif mode == "unstable"  
+        elseif params.initial_pop_type == :unstable
         # Deterministic development does not reach a stable state
-            matrices = [unstable_matrix() for _ in 1:pop_size]
+            matrices = [unstable_matrix() for _ in 1:params.pop_size]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif mode == "optimal clones"  
+        elseif params.initial_pop_type == :optimal_clones
         # Find a stable matrix and clone it with its expressed phenotype set as optimal
             candidate = stable_matrix()
             expressed_phenotype, _ = develop(candidate, initial_state, params.max_steps;
@@ -363,22 +365,22 @@ const valid_selection_types = [:wagner, :roulette]
             matrices = [copy(candidate) for _ in 1:params.pop_size]
             return (initial_state, expressed_phenotype, matrices)
 
-        elseif mode == "nonoptimal clones"
+        elseif params.initial_pop_type == :nonoptimal_clones
         # Find a stable matrix and clone it. The expressed phenotype is not necessarily optimal
             candidate = stable_matrix()
             matrices = [copy(candidate) for _ in 1:params.pop_size]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif mode == "ensemble sample"
+        elseif params.initial_pop_type == :ensemble_sample
         # Find many matrices in which the expressed phenotype is optimal
-            matrices = Vector{Matrix{Float64}}(undef, pop_size)
+            matrices = Vector{Matrix{Float64}}(undef, params.pop_size)
             population_count = 0
             attempts = 0
             attempt_limit = 5 * 2^(2*params.number_genes)  # Max attempts before restart (Wagner, 1996)
             
-            while population_count < pop_size
+            while population_count < params.pop_size
                 candidate = generate_random_matrix(params.number_genes, 
-                    params.noise_dist, params.initial_density)
+                    params.weights_dist, params.initial_density)
                 phenotype, _ = develop(candidate, initial_state, params.max_steps;
                 buffer1=buffer1, buffer2=buffer2)
 
@@ -401,7 +403,7 @@ const valid_selection_types = [:wagner, :roulette]
             
             return (initial_state, optimal_phenotype, matrices)
         else
-            error("Unknown mode: $mode")
+            error("Unknown initial population type: $(params.initial_pop_type)")
         end 
     end
 
@@ -448,7 +450,6 @@ const valid_selection_types = [:wagner, :roulette]
     """
         indiv_fitness(expressed_phenotype::Union{Vector{<:Real}, Nothing},
             optimal_phenotype::Vector{<:Real}, 
-            number_genes::Int,
             selection_pressure::Float64,
             unstable_fitness::Float64;
             distance::Function=hamming_distance,
@@ -459,7 +460,6 @@ const valid_selection_types = [:wagner, :roulette]
     # Arguments
     - `expressed_phenotype`: Phenotype vector or nothing if unstable
     - `optimal_phenotype`: Target phenotype vector
-    - `number_genes`: Number of genes in the genotype
     - `selection_pressure`: Selection strength parameter
     - `unstable_fitness`: Fitness value for unstable phenotypes
 
@@ -471,15 +471,13 @@ const valid_selection_types = [:wagner, :roulette]
     """
     function indiv_fitness(
         expressed_phenotype::Union{Vector{<:Real}, Nothing},
-        optimal_phenotype::Vector{<:Real}, 
-        number_genes::Int,
-        selection_pressure::Float64,
+        optimal_phenotype::Vector{<:Real},         selection_pressure::Float64,
         unstable_fitness::Float64;
         distance::Function=hamming_distance,
         )::Float64
         if !isnothing(expressed_phenotype)
             @fastmath begin
-                dist = distance(expressed_phenotype, optimal_phenotype, number_genes)
+                dist = distance(expressed_phenotype, optimal_phenotype)
                 return exp(-selection_pressure * dist)
             end
         else 
@@ -575,7 +573,7 @@ const valid_selection_types = [:wagner, :roulette]
         fitness = Vector{Float64}(undef, pop_size)
         offspring = Vector{Matrix{Float64}}(undef, pop_size)
         steps = Vector{Union{Int,Nothing}}(undef,pop_size)
-        noisy_W = Matrix{Float64}(undef, N_genes, N_genes)
+        noisy_W = Matrix{Float64}(undef, number_genes, number_genes)
 
         # ---Wagner-like selection--- 
         if selection_type == :wagner
@@ -588,11 +586,11 @@ const valid_selection_types = [:wagner, :roulette]
 
                     mutation!(W_candidate, mutation_prob, weights_dist)  # Mutation
                     copyto!(noisy_W, W_candidate)
-                    apply_noise!(noisy_W, noise_prob, noise_dist)  # Noisy gene interactions
+                    apply_noise!(noisy_W, noise_dist)  # Noisy gene interactions
 
                     expressed_phenotype, path_length = develop(noisy_W, initial_state, max_steps;
                         buffer1=buffer1, buffer2=buffer2) 
-                    fit = indiv_fitness(expressed_phenotype, optimal_phenotype, number_genes,
+                    fit = indiv_fitness(expressed_phenotype, optimal_phenotype, 
                         selection_pressure, unstable_fitness) # Compute fitness
                     
                     if rand() < fit  # Decide if offspring is added to the next generation
@@ -611,10 +609,10 @@ const valid_selection_types = [:wagner, :roulette]
         elseif selection_type == :roulette
             for i in 1:pop_size
                 copyto!(noisy_W, matrices[i])
-                apply_noise!(noisy_W, noise_prob, noise_dist)  # Noisy gene interactions
+                apply_noise!(noisy_W, noise_dist)  # Noisy gene interactions
                 expressed_phenotype, path_length = develop(noisy_W, initial_state, max_steps;
                 buffer1=buffer1, buffer2=buffer2)
-                fit = indiv_fitness(expressed_phenotype, optimal_phenotype, number_genes,
+                fit = indiv_fitness(expressed_phenotype, optimal_phenotype,
                     selection_pressure, unstable_fitness) # Compute fitness
                 
                 fitness[i] = fit
@@ -647,7 +645,7 @@ const valid_selection_types = [:wagner, :roulette]
     recombination, measuring network stability and phenotype expression over generations.
 
     # Arguments
-    - `parameters::SimulationParameters`: Simulation parameters
+    - `params::SimulationParameters`: Simulation parameters
 
     # Returns
     SimulationData with simulation results:
@@ -674,7 +672,7 @@ const valid_selection_types = [:wagner, :roulette]
             unstable_fitness, weights_dist = params
 
         simulation_data = SimulationData(
-            completion_history = zeros(generations),
+            completion_history = zeros(Int, generations),
             fitness_history = Matrix{Float64}(undef, generations, pop_size),
             matrices_history = Array{Matrix{Float64}}(undef, generations, pop_size),
             path_length_history = Matrix{Any}(undef, generations, pop_size),
@@ -698,7 +696,7 @@ const valid_selection_types = [:wagner, :roulette]
             return nothing
         end
 
-        initial_state, optimal_phenotype, matrices = initialize_population(parameters)
+        initial_state, optimal_phenotype, matrices = initialize_population(params)
         population = ArtificialPop(pop_size = pop_size, number_genes = number_genes,
             matrices = matrices, initial_state = initial_state,
             optimal_phenotype = optimal_phenotype)
@@ -713,8 +711,8 @@ const valid_selection_types = [:wagner, :roulette]
                 apply_noise!(noisy_W, noise_dist)
                 phenotype, path_length = develop(noisy_W, population.initial_state, max_steps;
                     buffer1=buffer1, buffer2=buffer2)
-                fit = indiv_fitness(phenotype, population.optimal_phenotype, number_genes, 
-                    selection_pressureunstable_fitness)
+                fit = indiv_fitness(phenotype, population.optimal_phenotype, 
+                    selection_pressure, unstable_fitness)
 
                 simulation_data.fitness_history[1,index] = fit
                 simulation_data.path_length_history[1, index] = path_length
@@ -733,7 +731,7 @@ const valid_selection_types = [:wagner, :roulette]
             copyto!(population.matrices, offspring)
         end
 
-        return data
+        return simulation_data
     end
 end
 # PROGRESS MARK AUGUST 11, 2026.

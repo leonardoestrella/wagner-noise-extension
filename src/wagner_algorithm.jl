@@ -110,8 +110,7 @@ const valid_selection_types = [:wagner, :roulette]
     The data from the simulation.
 
     # Fields
-    - `completion_history`: Number of GRNs that reached stability in that generation.
-        Size generations
+    - `completion_history`: Indicator if the GRN was stable. Shape (generations, pop_size)
     - `fitness_history`: Fitness of each GRN per generation. Shape (generations, pop_size)
     - `matrices_history`: All matrices of each generation. Size generations
     - `path_length_history`: Path length of each GRN per generation. Shape (generations, pop_size)
@@ -122,7 +121,7 @@ const valid_selection_types = [:wagner, :roulette]
     - Add regulator genes (not directly selected)
     """
     @kwdef mutable struct SimulationData
-        completion_history::Vector{Float64}
+        completion_history::BitMatrix
         fitness_history::Matrix{Float64}
         matrices_history::Array{Matrix{Float64}}
         path_length_history::Matrix{Union{Float64, Nothing}}
@@ -296,7 +295,7 @@ const valid_selection_types = [:wagner, :roulette]
         1. Initial state vector
         2. Optimal phenotype vector
         3. Vector of weight matrices
-    
+
     # Throws
     - `ArgumentError`: If the type of initial population is not valid
 
@@ -306,106 +305,107 @@ const valid_selection_types = [:wagner, :roulette]
     """
     function initialize_population(
         params::SimulationParameters
-        )::Tuple{Vector{Float64}, Vector{Float64}, Vector{Matrix{Float64}}}
-        params.initial_pop_type  in valid_initial_pop_types ||
-            throw(ArgumentError("$(params.initial_pop_type) is not a valid type of initial" * 
-                "population. Try with $valid_initial_pop_types"))
-             # TODO - check if the type of error is correct
+    )::Tuple{Vector{Float64},Vector{Float64},Vector{Matrix{Float64}}}
+
+        @unpack initial_pop_type, number_genes, max_steps, weights_dist,
+        initial_density, pop_size = params
+
+        initial_pop_type in valid_initial_pop_types ||
+            throw(ArgumentError("$(initial_pop_type) is not a valid type of initial" *
+                                "population. Try with $valid_initial_pop_types"))
         # ---Constants---
-        initial_state = rand([1.0,-1.0], params.number_genes) 
-        optimal_phenotype = rand([1.0, -1.0], params.number_genes)
+        initial_state = rand([1.0, -1.0], number_genes)
+        optimal_phenotype = rand([1.0, -1.0], number_genes)
         # TODO - Add possibility of switching [1.0,-1.0] domain to [1.0,0.0]
-        buffer1 = Vector{Float64}(undef, params.number_genes)
-        buffer2 = Vector{Float64}(undef, params.number_genes)
-        
+        buffer1 = Vector{Float64}(undef, number_genes)
+        buffer2 = Vector{Float64}(undef, number_genes)
+
         # ---Useful methods---
-        is_stable(matrix) = !isnothing(develop(matrix, initial_state, params.max_steps; 
+        is_stable(matrix) = !isnothing(develop(matrix, initial_state, max_steps;
             buffer1=buffer1, buffer2=buffer2)[1])
         stable_matrix() = begin
             while true
-                candidate = generate_random_matrix(params.number_genes,
-                    params.weights_dist, params.initial_density)
+                candidate = generate_random_matrix(number_genes,
+                    weights_dist, initial_density)
                 stability_test = is_stable(candidate)
                 stability_test && return candidate
             end
         end
         unstable_matrix() = begin
             while true
-                candidate = generate_random_matrix(params.number_genes,
-                    params.weights_dist, params.initial_density)
+                candidate = generate_random_matrix(number_genes,
+                    weights_dist, initial_density)
                 stability_test = !is_stable(candidate)
                 stability_test && return candidate
             end
         end
 
         # ---Generating populations---
-        if params.initial_pop_type == :random  
-        # No stability checks
+        if initial_pop_type == :random
+            # No stability checks
             matrices = [
-                generate_random_matrix(params.number_genes, 
-                    params.weights_dist, params.initial_density) 
+                generate_random_matrix(number_genes, weights_dist, initial_density)
                 for _ in 1:pop_size
             ]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif params.initial_pop_type == :stable
-        # Deterministic development reaches a stable state
-            matrices = [stable_matrix() for _ in 1:params.pop_size]
+        elseif initial_pop_type == :stable
+            # Deterministic development reaches a stable state
+            matrices = [stable_matrix() for _ in 1:pop_size]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif params.initial_pop_type == :unstable
-        # Deterministic development does not reach a stable state
-            matrices = [unstable_matrix() for _ in 1:params.pop_size]
+        elseif initial_pop_type == :unstable
+            # Deterministic development does not reach a stable state
+            matrices = [unstable_matrix() for _ in 1:pop_size]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif params.initial_pop_type == :optimal_clones
-        # Find a stable matrix and clone it with its expressed phenotype set as optimal
+        elseif initial_pop_type == :optimal_clones
+            # Find a stable matrix and clone it with its expressed phenotype set as optimal
             candidate = stable_matrix()
-            expressed_phenotype, _ = develop(candidate, initial_state, params.max_steps;
+            expressed_phenotype, _ = develop(candidate, initial_state, max_steps;
                 buffer1=buffer1, buffer2=buffer2)
-            matrices = [copy(candidate) for _ in 1:params.pop_size]
+            matrices = [copy(candidate) for _ in 1:pop_size]
             return (initial_state, expressed_phenotype, matrices)
 
-        elseif params.initial_pop_type == :nonoptimal_clones
-        # Find a stable matrix and clone it. The expressed phenotype is not necessarily optimal
+        elseif initial_pop_type == :nonoptimal_clones
+            # Find a stable matrix and clone it. The expressed phenotype is not necessarily optimal
             candidate = stable_matrix()
-            matrices = [copy(candidate) for _ in 1:params.pop_size]
+            matrices = [copy(candidate) for _ in 1:pop_size]
             return (initial_state, optimal_phenotype, matrices)
 
-        elseif params.initial_pop_type == :ensemble_sample
-        # Find many matrices in which the expressed phenotype is optimal
-            matrices = Vector{Matrix{Float64}}(undef, params.pop_size)
+        elseif initial_pop_type == :ensemble_sample
+            # Find many matrices in which the expressed phenotype is optimal
+            matrices = Vector{Matrix{Float64}}(undef, pop_size)
             population_count = 0
             attempts = 0
-            attempt_limit = 5 * 2^(2*params.number_genes)  # Max attempts before restart (Wagner, 1996)
-            
-            while population_count < params.pop_size
-                candidate = generate_random_matrix(params.number_genes, 
-                    params.weights_dist, params.initial_density)
-                phenotype, _ = develop(candidate, initial_state, params.max_steps;
-                buffer1=buffer1, buffer2=buffer2)
+            attempt_limit = 5 * 2^(2*number_genes)  # Max attempts before restart (Wagner, 1996)
 
-                if !isnothing(phenotype) && phenotype == optimal_phenotype
-                # Found a matrix with the desired phenotype
+            while population_count < pop_size
+                candidate = generate_random_matrix(number_genes, weights_dist, initial_density)
+                phenotype, steps = develop(candidate, initial_state, max_steps;
+                    buffer1=buffer1, buffer2=buffer2)
+
+                if !isnothing(steps) && phenotype == optimal_phenotype
+                    # Found a matrix with the desired phenotype
                     population_count += 1
                     matrices[population_count] = candidate
                     attempts = 0
                 else
                     attempts += 1
                 end
-                
+
                 if attempts > attempt_limit  # Reset if we've tried too many times
                     population_count = 0
                     attempts = 0
-                    initial_state = rand([1.0, -1.0], params.number_genes)
-                    optimal_phenotype = rand([1.0, -1.0], params.number_genes)
+                    initial_state = rand([1.0, -1.0], number_genes)
+                    optimal_phenotype = rand([1.0, -1.0], number_genes)
                 end
             end
-            
+
             return (initial_state, optimal_phenotype, matrices)
         else
-            error("Unknown initial population type: $(params.initial_pop_type)")
-        end 
+            error("Unknown initial population type: $(initial_pop_type)")
+        end
     end
 
     """
@@ -526,7 +526,7 @@ const valid_selection_types = [:wagner, :roulette]
             Vector{Matrix{Float64}},  # offspring
             Vector{Float64},          # fitness
             Vector{Any},              # steps
-            Float64,                  # completion_gen
+            BitVector,                # completion_gen
         }
 
     Generates a new generation of offspring matrices from an existing `ArtificialPop`
@@ -543,7 +543,7 @@ const valid_selection_types = [:wagner, :roulette]
         or parent (Roulette-type selection)
     3. `Vector{Union{Int,Nothing}}`: Number of steps each offspring took to reach a stable 
         state (`nothing` if unstable).
-    4. `Float64`: Fraction of offspring that reached stability (`completion_gen`).
+    4. `BitVector`: Indicator of offspring that reached stability (`completion_gen`).
 
     # Notes
     - Offspring are accepted into the new generation with a probability equal to their 
@@ -570,7 +570,7 @@ const valid_selection_types = [:wagner, :roulette]
             selection_pressure, selection_type, unstable_fitness, weights_dist = params
         @unpack matrices, initial_state, optimal_phenotype = pop  # avoid overwriting
         
-        completion_gen = 0.0
+        completion_gen = BitVector(undef, pop_size)
         fitness = Vector{Float64}(undef, pop_size)
         offspring = Vector{Matrix{Float64}}(undef, pop_size)
         steps = Vector{Union{Int,Nothing}}(undef,pop_size)
@@ -598,12 +598,11 @@ const valid_selection_types = [:wagner, :roulette]
                         offspring[i] = W_candidate 
                         fitness[i] = fit
                         steps[i] = path_length
-
+                        completion_gen[i] = !isnothing(path_length)
                         survival = true
                     end
                 end 
             end
-            completion_gen = 1.0 - count(isnothing, steps) / pop_size
             
             return offspring, fitness, steps, completion_gen
         # ---Roulette selection---
@@ -624,7 +623,7 @@ const valid_selection_types = [:wagner, :roulette]
             parents_indices = sample(1:pop_size, Weights(normalized_fitness), (2,pop_size);
                 replace=true)
             # Choose parents with a probability proportional to their fitness
-            completion_gen = 1.0 - count(isnothing, steps) / pop_size  # stable development
+            completion_gen = .!isnothing.(steps) # stable development
 
             for i in 1:pop_size  # Populate next generation
                 parent_i, parent_j = parents_indices[1,i], parents_indices[2,i]
@@ -653,7 +652,7 @@ const valid_selection_types = [:wagner, :roulette]
     - `"matrices_history"::Array{Matrix{Float64},2}`: Weight matrices, shape (generations, pop_size)
     - `"fitness"::Matrix{Float64}`: Individual fitness values, shape (generations, pop_size)
     - `"path_length"::Matrix{Union{Int,Nothing}}`: Steps to stability, shape (generations, pop_size)
-    - `"completion"::Vector{Float64}`: Fraction stable per generation, length generations
+    - `"completion"::BitMatrix`: Indicator if matrices are stable. Shape (generations, pop_size)
     - `"initial_state"::Vector{Int}`: Initial gene expression state
     - `"phenotypic_optima"::Vector{Int}`: Target phenotype vector
 
@@ -673,34 +672,34 @@ const valid_selection_types = [:wagner, :roulette]
             unstable_fitness, weights_dist = params
 
         simulation_data = SimulationData(
-            completion_history = zeros(Float64, generations),
-            fitness_history = Matrix{Float64}(undef, generations, pop_size),
-            matrices_history = Array{Matrix{Float64}}(undef, generations, pop_size),
-            path_length_history = Matrix{Any}(undef, generations, pop_size),
-            initial_state = Vector{Float64}(undef, number_genes),
-            optimal_phenotype = Vector{Float64}(undef, number_genes),
+            completion_history=BitMatrix(undef, (generations, pop_size)),
+            fitness_history=Matrix{Float64}(undef, generations, pop_size),
+            matrices_history=Array{Matrix{Float64}}(undef, generations, pop_size),
+            path_length_history=Matrix{Any}(undef, generations, pop_size),
+            initial_state=Vector{Float64}(undef, number_genes),
+            optimal_phenotype=Vector{Float64}(undef, number_genes),
         )
         noisy_W = Matrix{Float64}(undef, number_genes, number_genes)  # Preallocate memory
         buffer1 = Vector{Float64}(undef, number_genes)
         buffer2 = Vector{Float64}(undef, number_genes)
 
         # Helper function
-        function record_generation!(gen::Int, offspring::Vector{Matrix{Float64}},
-            fit::Vector{Float64}, steps::Vector{Union{Int,Nothing}}, completion::Int;
+        function record_generation!(gen::Int, offspring::Vector{Matrix{Float64}}, 
+            fit::Vector{Float64}, steps::Vector{Union{Int,Nothing}}, completion_gen::BitVector,
             simulation_data::SimulationData=simulation_data)
 
             simulation_data.matrices_history[gen, :] .= offspring
             simulation_data.fitness_history[gen, :] .= fit
             simulation_data.path_length_history[gen, :] .= steps
-            simulation_data.completion_history[gen] .= completion / pop_size
+            simulation_data.completion_history[gen, :] .= completion_gen
 
             return nothing
         end
 
         initial_state, optimal_phenotype, matrices = initialize_population(params)
-        population = ArtificialPop(pop_size = pop_size, number_genes = number_genes,
-            matrices = matrices, initial_state = initial_state,
-            optimal_phenotype = optimal_phenotype)
+        population = ArtificialPop(pop_size=pop_size, number_genes=number_genes,
+            matrices=matrices, initial_state=initial_state,
+            optimal_phenotype=optimal_phenotype)
         simulation_data.initial_state = initial_state
         simulation_data.optimal_phenotype = optimal_phenotype
 
@@ -715,12 +714,11 @@ const valid_selection_types = [:wagner, :roulette]
                 fit = indiv_fitness(phenotype, population.optimal_phenotype, 
                     selection_pressure, unstable_fitness)
 
-                simulation_data.fitness_history[1,index] .= fit
-                simulation_data.path_length_history[1, index] .= path_length
-                simulation_data.matrices_history[1, index] .= matrix
+                simulation_data.fitness_history[1,index] = fit
+                simulation_data.path_length_history[1, index] = path_length
+                simulation_data.matrices_history[1, index] = matrix
+                simulation_data.completion_history[1, index] = !isnothing(path_length)
             end
-            simulation_data.completion_history[1] .= 1.0 - count(isnothing,
-                simulation_data.path_length_history[1,:]) / pop_size
             start_gen = 2
         else
             start_gen = 1

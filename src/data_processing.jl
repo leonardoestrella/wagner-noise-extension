@@ -1,5 +1,5 @@
 """
-    Custom Stats
+    CustomStats
 
 Provides the data analysis tools used in these simulations. It achieves three things:
 1. Summarize data into average and standard deviations per generation across simulations
@@ -11,12 +11,12 @@ Provides the data analysis tools used in these simulations. It achieves three th
     (generations, pop_size) into two vectors of size generations
 - `alignment_score`: Computes the alignment score of a marix, returning a Float64. To use in
     a grid of matrices, use broadcasting as alignment_score.(grid_matrices, Ref(vector)).
-- `mutational_robustness`: Computes the mutational robustness metrics of a matrix and returns
+- `compute_mut_robustness`: Computes the mutational robustness metrics of a matrix and returns
     a Tuple of four Float64. To use in a grid of matrices, use broadcasting as
-    mutational_robustness.(grid_matrices,Ref(...))
+    compute_mut_robustness.(grid_matrices,Ref(...))
 
 # Notes
-- mutational_robustness_pop takes samples across time and population sizes because it is very
+- compute_mut_robustness assumes samples across time and population sizes because it is very
     expensive to run. 
 - The module does not use parallel processing because threads are dedicated to running
     multiple experiments. 
@@ -27,14 +27,13 @@ using Distributions
 using LinearAlgebra
 using Random
 
-include("../src/wagner_algorithm.jl")
-using .BooleanNetwork  # SimulationData, SimulationParameters
-#  TODO - Corroborate if this is appropriate. I want to specify the structure I am using, and
-#   importing the entire module at the same time?
-
 using StatsBase: mean, std, var
 
-export summarize_history, alignment_score, mutational_robustness_pop
+include("../src/wagner_algorithm.jl")
+using ..BooleanNetwork: SimulationData, SimulationParameters
+using ..BooleanNetwork: apply_noise!, develop, mutation!
+
+export summarize_history, summarize_simulation_run, alignment_score, compute_mut_robustness
 
     """
         summarize_history(data::AbstractArray) -> Tuple {Vector{Float64}, Vector{Float64}}
@@ -67,14 +66,14 @@ export summarize_history, alignment_score, mutational_robustness_pop
             n = length(filtered_data)
 
             if n == 0
-                means[i] = NaN
-                stds[i]  = NaN
+                means[row_idx] = NaN
+                stds[row_idx] = NaN
             elseif n == 1
-                means[i] = filtered_data[1]
-                stds[i]  = NaN  
+                means[row_idx] = filtered_data[1]
+                stds[row_idx] = NaN
             else
-                means[i] = mean(filtered_data)
-                stds[i]  = std(filtered_data; corrected=true)
+                means[row_idx] = mean(filtered_data)
+                stds[row_idx] = std(filtered_data; corrected=true)
             end
         end
         return (means, stds)
@@ -96,12 +95,14 @@ export summarize_history, alignment_score, mutational_robustness_pop
     - It is possible to broadcast to a grid of matrices by setting Ref(vec)
     """
     function alignment_score(matrix::Matrix{Float64}, vector::Vector{Float64})::Float64
+        number_genes = size(matrix, 1)
         normalized_mat = mapslices(matrix; dims=2) do row  # Normalize rows by their L1 norms
             row_norm = norm(row, 1)
             iszero(row_norm) ? row : row / row_norm  # Leave as empty if it was empty
         end
 
-        return dot(vector, normalized_mat, vector)  # vector^T * normalized_mat * vector
+        return dot(vector, normalized_mat, vector) / number_genes
+        # vector^T * normalized_mat * vector / number_genes
     end
 
     """
@@ -110,10 +111,10 @@ export summarize_history, alignment_score, mutational_robustness_pop
     Wrapper for the main statistics of a run. 
 
     Returns a dictionary with keys:
-    - fitness_stats: Vector of per-generation fitness statistics
-    - path_stats: Vector of per-generation path length statistics
-    - completion_stats: Vector of per-generation completion rates
-    - alignment_stats: Vector of per-generation alignment statistics
+    - fitness_stats: Tuple of vectors of per-generation fitness statistics: (mean, std)
+    - path_stats: Tuple of vectorss of per-generation path length statistics: (mean, std)
+    - completion_stats: Tuple of vectors of per-generation completion rates: (mean, std)
+    - alignment_stats: Tuple of vectors of per-generation alignment statistics: (mean, std)
     """  
     function summarize_simulation_run(result::SimulationData)::Dict
         alignment_scores_population = alignment_score.(result.matrices_history, 
@@ -121,8 +122,7 @@ export summarize_history, alignment_score, mutational_robustness_pop
         return Dict(
             "fitness_stats" => summarize_history(result.fitness_history),
             "path_stats" => summarize_history(result.path_length_history),
-            "completion_stats" => (mean(result.completion_history), 
-                std(result.completion_history; corrected=true)),
+            "completion_stats" => summarize_history(float(result.completion_history)),
             "alignment_stats" => summarize_history(alignment_scores_population)
         )
     end
@@ -155,7 +155,7 @@ export summarize_history, alignment_score, mutational_robustness_pop
                             initial_state::Vector{Float64},
                             number_noise_samples::Int,
                             noise_dist::Distribution,
-                            max_steps::Int=SimulationParameters.max_steps,
+                            max_steps::Int=SimulationParameters().max_steps,
     )::Tuple{Vector{Float64}, Float64}
         number_genes = size(matrix, 1)
         unstable_count = 0
@@ -167,13 +167,13 @@ export summarize_history, alignment_score, mutational_robustness_pop
 
         for idx in 1:number_noise_samples
             copyto!(buffer_matrix, matrix)
-            BooleanNetwork.apply_noise!(buffer_matrix, noise_prob, noise_dist)
-            final_state, _ = BooleanNetwork.develop(buffer_matrix, initial_state, max_steps;
+            apply_noise!(buffer_matrix, noise_dist)
+            final_state, _ = develop(buffer_matrix, initial_state, max_steps;
                 buffer1=buffer_vec_1, buffer2=buffer_vec_2)
 
             if !isnothing(final_state)
                 stable_count += 1
-                stable_states[stable_count, :] = final_state
+                stable_states[stable_count, :] .= final_state
             else
                 unstable_count += 1
             end
@@ -236,12 +236,14 @@ export summarize_history, alignment_score, mutational_robustness_pop
         initial_state::Vector{Float64},
         number_mutation_samples::Int,
         number_noise_samples::Int,
-        noise_dist::Distribution;
-        mutation_prob::Float64, 
-        weights_dist::Distribution=SimulationParameters.weights_dist,
-        max_steps::Int=SimulationParameters.max_steps,
-    )::NamedTuple{stable_expression_shift::Float64, stable_expression_var::Float64,
-        unstable_prob_shift::Float64, unstable_prob_var::Float64}
+        noise_dist::Distribution,
+        mutation_prob::Float64; 
+        weights_dist::Distribution=SimulationParameters().weights_dist,
+        max_steps::Int=SimulationParameters().max_steps,
+    )::NamedTuple{(:stable_expression_shift, :stable_expression_var, 
+    :unstable_prob_shift, :unstable_prob_var), 
+    Tuple{Float64, Float64, Float64, Float64}      
+    }
         number_mutation_samples > 1 ||
             throw(ArgumentError("number_mutations_samples must be larger than 1! Got " *
                 "$number_mutation_samples"))
@@ -259,13 +261,13 @@ export summarize_history, alignment_score, mutational_robustness_pop
 
         for mutation_idx in 1:number_mutation_samples
             copyto!(mutated_matrix, matrix)
-            BooleanNetwork.mutation!(mutated_matrix, mutation_prob, mutation_dist)
+            mutation!(mutated_matrix, mutation_prob, weights_dist)
             
             mutated_mean, mutated_unstable_prob = generate_expression_distribution(
                 mutated_matrix, initial_state, number_noise_samples, noise_dist, max_steps)
 
             stable_expressions[mutation_idx,:] .= mutated_mean
-            unstable_probs[mutation_idx] .= mutated_unstable_prob
+            unstable_probs[mutation_idx] = mutated_unstable_prob
         end
 
         mean_stable_expression_mutations = vec(mean(stable_expressions, dims=1))
@@ -277,10 +279,10 @@ export summarize_history, alignment_score, mutational_robustness_pop
         unstable_prob_shift = baseline_unstable_prob - mean_unstable_prob_mutations
 
         return (
-            stable_expression_shift = stable_expression_shift,
-            stable_expression_var = stable_expression_var,
-            unstable_prob_shift = unstable_prob_shift,
-            unstable_prob_var = unstable_prob_var
+            stable_expression_shift=stable_expression_shift,
+            stable_expression_var=stable_expression_var,
+            unstable_prob_shift=unstable_prob_shift,
+            unstable_prob_var=unstable_prob_var
         )
-    end  # PROGRESS MARK: AUGUST 17, 2026
+    end 
 end # module

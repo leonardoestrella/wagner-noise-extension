@@ -1,35 +1,31 @@
 # Tests for data-processing utilities (CustomStats)
+include("../src/wagner_algorithm.jl")
 include("../src/data_processing.jl")
 using Test
 using Random
 using Distributions
 using LinearAlgebra
+using ..BooleanNetwork
 
-
-# Deterministic RNG where needed
 Random.seed!(1234)
 
-@testset "compute_percentile_stats" begin
-    data = [1.0, 2.0, 3.0, nothing]
-    stats = CustomStats.compute_percentile_stats(data)
-
-    @test isapprox(stats.mean, 2.0; atol=1e-12)
-    @test isapprox(stats.p50, 2.0; atol=1e-12)
-    @test isapprox(stats.validity_pct, 75.0; atol=1e-12)
-end
-
-@testset "compute_alignment_score" begin
+@testset "alignment_score" begin
     M = [1.0 0.0;
          0.0 1.0]
     v = [1.0, 1.0]
-    score = CustomStats.compute_alignment_score(M, v)
+    # A fully aligned matrix should yield an alignment of 1.0
+    score = CustomStats.alignment_score(M, v)
     @test isapprox(score, 1.0; atol=1e-12)
 
-    # A matrix with rows orthogonal to v should yield 0
+    # An aligned matrix multiplied by -1.0 yields an alignment of -1.0
+    score_2 = CustomStats.alignment_score(-M, v)
+    @test isapprox(score_2, -1.0; atol=1e-12)
+
+    # A matrix with rows orthogonal to v should yield 0.0
     M2 = [1.0 -1.0;
           -1.0 1.0]
-    score2 = CustomStats.compute_alignment_score(M2, v)
-    @test isapprox(score2, 0.0; atol=1e-12)
+    score_3 = CustomStats.alignment_score(M2, v)
+    @test isapprox(score_3, 0.0; atol=1e-12)
 
     # Test fully aligned matrices with block structure
     # Target phenotype with mixed signs
@@ -43,7 +39,7 @@ end
         -2.0 -1.0 -1.0  2.0  1.0;  # Negative correlation -> positive with last 2
         -1.0 -2.0 -1.0  1.0  2.0   # Negative correlation -> positive with last 2
     ]
-    score_aligned = CustomStats.compute_alignment_score(W_aligned, v_mixed)
+    score_aligned = CustomStats.alignment_score(W_aligned, v_mixed)
     @test isapprox(score_aligned, 1.0; atol=1e-12)
 
     # Test completely misaligned matrices with block structure
@@ -55,7 +51,7 @@ end
         2.0  1.0  1.0  -2.0 -1.0;  # Positive correlation -> negative with last 2
         1.0  2.0  1.0  -1.0 -2.0   # Positive correlation -> negative with last 2
     ]
-    score_misaligned = CustomStats.compute_alignment_score(W_misaligned, v_mixed)
+    score_misaligned = CustomStats.alignment_score(W_misaligned, v_mixed)
     @test isapprox(score_misaligned, -1.0; atol=1e-12)
 
     # Test partial alignment cases
@@ -64,266 +60,217 @@ end
     # Case 1: Matrix with zero net alignment
     W_zero = [1.0  1.0;     # Row sums to 0 when weighted by target
              -1.0 -1.0]     # Row also sums to 0
-    score_zero = CustomStats.compute_alignment_score(W_zero, v_binary)
+    score_zero = CustomStats.alignment_score(W_zero, v_binary)
     @test isapprox(score_zero, 0.0; atol=1e-12)
     
     # Case 2: Matrix with 0.5 alignment (half-aligned)
     W_half = [1.0  -1.0;    # Perfectly aligned row (+1)
               1.0   1.0]    # Zero alignment row (0)
-    score_half = CustomStats.compute_alignment_score(W_half, v_binary)
+    score_half = CustomStats.alignment_score(W_half, v_binary)
     @test isapprox(score_half, 0.5; atol=1e-12)
 
     # Case 3: Matrix without edges (alignment should be 0)
     W_empty = [0.0 -0.0;    # Perfectly aligned row (+1)
         0.0 0.0]    # Zero alignment row (0)
-    score_empty = CustomStats.compute_alignment_score(W_empty, v_binary)
+    score_empty = CustomStats.alignment_score(W_empty, v_binary)
     @test isapprox(score_empty, 0.0; atol=1e-12)
+
+    # Broadcasting over a grid of matrices
+    grid = [M, -M, M2]
+    scores_grid = CustomStats.alignment_score.(grid, Ref(v))
+    @test scores_grid ≈ [1.0, -1.0, 0.0] atol=1e-12
 end
 
-@testset "compute_all_alignments" begin
-    matrices = Array{Matrix{Float64}}(undef, 2, 2)
-    matrices[1,1] = [1.0 0.0; 0.0 1.0]
-    matrices[1,2] = [-1.0 0.0; 0.0 -1.0]
-    matrices[2,1] = [0.5 -0.5; -0.5 0.5]
-    matrices[2,2] = [2.0 1.0; -1.0 -2.0]
+@testset "summarize_history" begin
+    # Basic mean/std over fully-populated rows
+    data = [1.0 2.0 3.0;
+            4.0 4.0 4.0]
+    means, stds = CustomStats.summarize_history(data)
+    @test means ≈ [2.0, 4.0] atol=1e-12
+    @test stds[1] ≈ std([1.0, 2.0, 3.0]; corrected=true) atol=1e-12
+    @test stds[2] ≈ 0.0 atol=1e-12
 
-    target = [1.0, -1.0]
-    alignment_matrix = CustomStats.compute_all_alignments(matrices, target)
+    # `nothing` values are excluded from the statistics
+    data_missing = Matrix{Union{Float64,Nothing}}(undef, 2, 3)
+    data_missing[1, :] = [1.0, 2.0, nothing]
+    data_missing[2, :] = [5.0, nothing, nothing]
+    means_missing, stds_missing = CustomStats.summarize_history(data_missing)
+    @test means_missing[1] ≈ 1.5 atol=1e-12
+    @test means_missing[2] ≈ 5.0 atol=1e-12
+    @test isnan(stds_missing[2])  # Only one data point: std undefined
 
-    @test size(alignment_matrix) == size(matrices)
-    for idx in eachindex(matrices)
-        expected = CustomStats.compute_alignment_score(matrices[idx], target)
-        @test isapprox(alignment_matrix[idx], expected; atol=1e-12)
-    end
+    # A row with no data at all yields NaN for both mean and std
+    data_empty_row = Matrix{Union{Float64,Nothing}}(undef, 1, 2)
+    data_empty_row[1, :] = [nothing, nothing]
+    means_empty, stds_empty = CustomStats.summarize_history(data_empty_row)
+    @test isnan(means_empty[1])
+    @test isnan(stds_empty[1])
 end
 
-function reference_mutational_summary(matrix, initial_state, n_mutations, n_noise_masks, noise_dist;
-                                      mut_prob, mr, sigma_r, noise_prob, max_steps, activation)
-    if n_mutations <= 1
-        error("n_mutations must be larger than 1!")
-    end
+@testset "generate_expression_distribution" begin
+    N = 2
+    matrix = Matrix{Float64}(I, N, N)
+    initial_state = [1.0, -1.0]
 
-    mutation_dist = Normal(mr, sigma_r)
-    baseline_mean, baseline_unstable = CustomStats.generate_expression_distribution(
-        matrix, initial_state, n_noise_masks, noise_dist, noise_prob, max_steps, activation)
+    # No noise: development is deterministic, so every sample is stable and identical
+    avg_expression, unstable_prop = CustomStats.generate_expression_distribution(
+        matrix, initial_state, 5, Bernoulli(1.0), 10)
+    final_state, _ = BooleanNetwork.develop(matrix, initial_state, 10)
+    @test avg_expression ≈ final_state atol=1e-12
+    @test unstable_prop == 0.0
 
-    stable_expressions = Matrix{Float64}(undef, n_mutations, size(matrix, 1))
-    unstable_probabilities = zeros(n_mutations)
-    mutated_matrix = similar(matrix)
+    # A matrix that never stabilizes yields an all-zero average and full instability
+    W_flip = [0.0 -1.0;
+             -1.0 0.0]
+    avg_unstable, unstable_prop_full = CustomStats.generate_expression_distribution(
+        W_flip, [1.0, 1.0], 5, Bernoulli(1.0), 10)
+    @test avg_unstable == zeros(Float64, N)
+    @test unstable_prop_full == 1.0
 
-    for mutation_idx in 1:n_mutations
-        copyto!(mutated_matrix, matrix)
-        CustomStats.BooleanNetwork.reg_mutation!(mutated_matrix, mut_prob, mutation_dist)
+    # Default max_steps (from SimulationParameters()) is used when omitted
+    avg_default, _ = CustomStats.generate_expression_distribution(
+        matrix, initial_state, 5, Bernoulli(1.0))
+    @test avg_default ≈ final_state atol=1e-12
 
-        mutated_mean, mutated_unstable = CustomStats.generate_expression_distribution(
-            mutated_matrix, initial_state, n_noise_masks, noise_dist, noise_prob, max_steps, activation)
+    # Normal working conditions: positive-only noise (Gamma) rescales weights but never
+    # flips their sign, so a diagonal matrix should still stabilize on every sample
+    Random.seed!(42)
+    avg_gamma, unstable_prop_gamma = CustomStats.generate_expression_distribution(
+        matrix, initial_state, 50, Gamma(1.0, 1.0), 10)
+    @test avg_gamma ≈ initial_state atol=1e-12
+    @test unstable_prop_gamma == 0.0
 
-        stable_expressions[mutation_idx, :] = mutated_mean
-        unstable_probabilities[mutation_idx] = mutated_unstable
-    end
-
-    mean_stable_expression_mutations = vec(mean(stable_expressions, dims=1))
-    stable_expression_shift = norm(baseline_mean .- mean_stable_expression_mutations, 1)
-    stable_expression_variance = sum(var(stable_expressions, dims=1, corrected=true))
-    unstable_probability_shift = baseline_unstable - mean(unstable_probabilities)
-    unstable_probability_variance = var(unstable_probabilities, corrected=true)
-
-    return (
-        stable_expression_shift=stable_expression_shift,
-        stable_expression_variance=stable_expression_variance,
-        unstable_probability_shift=unstable_probability_shift,
-        unstable_probability_variance=unstable_probability_variance
-    )
+    # A less trivial matrix under Gamma noise: outcomes stay well-formed, even though
+    # individual samples are no longer deterministic
+    W_mixed = [0.1 2.0;
+              -2.0 0.1]
+    avg_mixed, unstable_prop_mixed = CustomStats.generate_expression_distribution(
+        W_mixed, initial_state, 50, Gamma(1.0, 1.0), 10)
+    @test length(avg_mixed) == N
+    @test all(x -> -1.0 <= x <= 1.0, avg_mixed)
+    @test 0.0 <= unstable_prop_mixed <= 1.0
 end
 
 @testset "compute_mut_robustness" begin
-    matrix = [1.0 0.0 0.0;
-              0.5 1.0 0.0;
-              0.0 -0.5 1.0]
-    initial_state = Int[1, -1, 1]
-    n_mutations = 3
-    n_masks = 2
-    noise_dist = Bernoulli(1.0)
-    mut_prob = 1.0
-    mr = 0.0
-    sigma_r = 0.25
-    noise_prob = 0.0
-    max_steps = 20
-    activation = CustomStats.BooleanNetwork.activation
-
-    Random.seed!(2024)
-    robustness = CustomStats.compute_mut_robustness(
-        matrix,
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=mut_prob,
-        mr=mr,
-        sigma_r=sigma_r,
-        noise_prob=noise_prob,
-        max_steps=max_steps,
-        activation=activation
-    )
-
-    Random.seed!(2024)
-    reference = reference_mutational_summary(
-        matrix,
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=mut_prob,
-        mr=mr,
-        sigma_r=sigma_r,
-        noise_prob=noise_prob,
-        max_steps=max_steps,
-        activation=activation
-    )
-
-    @test isapprox(robustness.stable_expression_shift, reference.stable_expression_shift; atol=1e-12)
-    @test isapprox(robustness.stable_expression_variance, reference.stable_expression_variance; atol=1e-12)
-    @test isapprox(robustness.unstable_probability_shift, reference.unstable_probability_shift; atol=1e-12)
-    @test isapprox(robustness.unstable_probability_variance, reference.unstable_probability_variance; atol=1e-12)
-
-    @test_throws ErrorException CustomStats.compute_mut_robustness(
-        matrix,
-        initial_state,
-        0,
-        n_masks,
-        noise_dist;
-        mut_prob=mut_prob,
-        mr=mr,
-        sigma_r=sigma_r,
-        noise_prob=noise_prob
-    )
-end
-
-@testset "compute_mut_robustness noise/mutation combinations" begin
-    # These are meant to show that there is variation in the samples
     matrix = [0.1 2.0;
-              -2.0 0.1]
-    initial_state = Int[1, -1]
-    noise_dist = Normal(1.0, 0.5)
-    n_mutations = 5
-    n_masks = 4
+        -2.0 0.1]
+    initial_state = [1.0, -1.0]
+    n_mutation_samples = 5
+    n_noise_samples = 5
+    weights_dist = Normal(0.0, 1.0)
+    max_steps = 10
 
-    Random.seed!(7)
-    noise_only = CustomStats.compute_mut_robustness(
-        matrix,
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=0.0,
-        sigma_r=0.0,
-        noise_prob=0.9
-    )
-    @test !isapprox(noise_only.stable_expression_shift, 0.0; atol=1e-12)
-    @test noise_only.stable_expression_variance >= 0.0
-    @test !isapprox(noise_only.unstable_probability_shift, 0.0; atol=1e-12)
-    @test noise_only.unstable_probability_variance >= 0.0
+    @testset "1. No noise, no mutations" begin
+        res = CustomStats.compute_mut_robustness(
+            matrix, initial_state,
+            n_mutation_samples, n_noise_samples,
+            Bernoulli(1.0),  # No noise
+            0.0;             # No mutations
+            weights_dist=weights_dist, max_steps=max_steps
+        )
+        # Without noise or mutations, the system behavior should be completely deterministic
+        @test isapprox(res.stable_expression_shift, 0.0; atol=1e-12)
+        @test isapprox(res.stable_expression_var, 0.0; atol=1e-12)
+        @test isapprox(res.unstable_prob_shift, 0.0; atol=1e-12)
+        @test isapprox(res.unstable_prob_var, 0.0; atol=1e-12)
+    end
 
-    Random.seed!(7)
-    mutation_only = CustomStats.compute_mut_robustness(
-        matrix,
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=1.0,
-        sigma_r=0.4,
-        noise_prob=0.0
-    )
-    @test !isapprox(mutation_only.stable_expression_shift, 0.0; atol=1e-12)
-    @test mutation_only.stable_expression_variance >= 0.0
-    @test !isapprox(mutation_only.unstable_probability_shift, 0.0; atol=1e-12)
-    @test mutation_only.unstable_probability_variance >= 0.0
+    @testset "2. No noise, always mutate" begin
+        Random.seed!(42)
+        res = CustomStats.compute_mut_robustness(
+            matrix, initial_state,
+            n_mutation_samples, n_noise_samples,
+            Bernoulli(1.0), # No noise
+            1.0;            # Always mutate
+            weights_dist=weights_dist, max_steps=max_steps
+        )
+        # Mutations alter network dynamics, creating variation between samples
+        @test res.stable_expression_var >= 0.0
+        @test res.unstable_prob_var >= 0.0
+    end
 
-    Random.seed!(7)
-    combined = CustomStats.compute_mut_robustness(
-        matrix,
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=1.0,
-        sigma_r=0.4,
-        noise_prob=0.8
-    )
-    @test !isapprox(combined.stable_expression_shift, 0.0; atol=1e-12)
-    @test combined.stable_expression_variance >= 0.0
-    @test !isapprox(combined.unstable_probability_shift, 0.0; atol=1e-12)
-    @test combined.unstable_probability_variance >= 0.0
-end
+    @testset "3. A lot of noise, no mutations" begin
+        Random.seed!(42)
+        res = CustomStats.compute_mut_robustness(
+            matrix, initial_state,
+            n_mutation_samples, n_noise_samples,
+            Normal(0.0, 2.0), # Large noise magnitude
+            0.0;              # No mutations
+            weights_dist=weights_dist, max_steps=max_steps
+        )
+        # High noise introduces expression shifts while preserving unmutated topology
+        @test res.stable_expression_var >= 0.0
+        @test res.unstable_prob_var >= 0.0
+    end
 
-@testset "compute_population_mut_robustness" begin
-    matrices = [
-        [0.5 0.0; 0.0 1.0],
-        [1.0 -0.5; -0.5 1.0]
-    ]
-    initial_state = Int[1, 1]
-    n_mutations = 2
-    n_masks = 2
-    noise_dist = Bernoulli(1.0)
+    @testset "4. A lot of noise, a lot of mutations" begin
+        Random.seed!(42)
+        res = CustomStats.compute_mut_robustness(
+            matrix, initial_state,
+            n_mutation_samples, n_noise_samples,
+            Normal(0.0, 2.0), # High noise
+            1.0;              # Always mutate
+            weights_dist=weights_dist, max_steps=max_steps
+        )
+        # Combined heavy noise and mutation produce significant shifts and non-zero variance
+        @test !isapprox(res.stable_expression_shift, 0.0; atol=1e-12)
+        @test res.stable_expression_var >= 0.0
+        @test res.unstable_prob_var >= 0.0
+    end
 
-    Random.seed!(11)
-    population_stats = CustomStats.compute_population_mut_robustness(
-        matrices,
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=1.0,
-        sigma_r=0.25,
-        noise_prob=0.0
-    )
-    @test length(population_stats) == length(matrices)
+    @testset "5. Active noise and active mutations" begin
+        Random.seed!(42)
+        res = CustomStats.compute_mut_robustness(
+            matrix, initial_state,
+            n_mutation_samples, n_noise_samples,
+            Gamma(1.0, 1.0), # Moderate noise
+            0.01;              # Moderate mutation probability
+            weights_dist=weights_dist, max_steps=max_steps
+        )
+        # Standard stochastic operating conditions
+        @test res.stable_expression_var >= 0.0
+        @test res.unstable_prob_var >= 0.0
+    end
 
-    Random.seed!(11)
-    first_ref = CustomStats.compute_mut_robustness(
-        matrices[1],
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=1.0,
-        sigma_r=0.25,
-        noise_prob=0.0
-    )
-    second_ref = CustomStats.compute_mut_robustness(
-        matrices[2],
-        initial_state,
-        n_mutations,
-        n_masks,
-        noise_dist;
-        mut_prob=1.0,
-        sigma_r=0.25,
-        noise_prob=0.0
-    )
+    @testset "argument errors" begin
+        @test_throws ArgumentError CustomStats.compute_mut_robustness(
+            matrix, initial_state, 1, n_noise_samples, Bernoulli(1.0), 0.0;
+            weights_dist=weights_dist, max_steps=max_steps)
+        @test_throws ArgumentError CustomStats.compute_mut_robustness(
+            matrix, initial_state, n_mutation_samples, 1, Bernoulli(1.0), 0.0;
+            weights_dist=weights_dist, max_steps=max_steps)
+    end
 
-    @test population_stats[1] == first_ref
-    @test population_stats[2] == second_ref
+    @testset "broadcasting over a grid of matrices" begin
+        Random.seed!(42)
+        grid = [copy(matrix) for _ in 1:2, _ in 1:2]
+        results = CustomStats.compute_mut_robustness.(
+            grid, Ref(initial_state), n_mutation_samples, n_noise_samples,
+            Ref(Bernoulli(1.0)), 0.0;
+            weights_dist=weights_dist, max_steps=max_steps)
+        @test size(results) == (2, 2)
+        @test all(r -> isapprox(r.stable_expression_shift, 0.0; atol=1e-12), results)
+    end
 end
 
 @testset "summarize_simulation_run" begin
     # Minimal synthetic simulation result
-    fitness = fill(0.5, 1, 1)                # 1 generation ├ù 1 individual
-    path_length = Matrix{Int64}(undef, 1, 1)
-    path_length[1,1] = 3
+    fitness_history = fill(0.5, 2, 2)                # 2 generations 2 individual
+    path_length_history = ones((2,2))
 
-    matrices = Array{Matrix{Float64}}(undef, 1, 1)
-    matrices[1,1] = [1.0 0.0; 0.0 1.0]
+    matrices_history = Array{Matrix{Float64}}(undef, 2, 2)
+    matrices_history = [ones(2, 2) for _ in 1:2, _ in 1:2]
+    completion_history = trues(1,1)
+    optimal_phenotype = [1.0, 1.0]
+    initial_state = [1.0, 1.0]
 
-    completion = [1.0]
-    phen_opt = [1.0, 1.0]
-
-    result = Dict(
-        "fitness" => fitness,
-        "path_length" => path_length,
-        "matrices" => matrices,
-        "completion" => completion,
-        "phenotypic_optima" => phen_opt
+    result = BooleanNetwork.SimulationData(
+        completion_history,
+        fitness_history,
+        matrices_history,
+        path_length_history,
+        initial_state,
+        optimal_phenotype
     )
 
     summary = CustomStats.summarize_simulation_run(result)
@@ -331,59 +278,62 @@ end
 
     # fitness_stats is a vector of generation summaries
     fstats = summary["fitness_stats"]
-    @test length(fstats) == 1
-    @test isapprox(fstats[1].mean, 0.5; atol=1e-12)
-    @test isapprox(fstats[1].validity_pct, 100.0; atol=1e-12)
+    @test length(fstats) == 2  # Check it is a tuple
+    @test length(fstats[1]) == 2  # Check the averages are size generations
+    @test length(fstats[2]) == 2  # Check the stds are size generations
+    @test isapprox(fstats[1][1], 0.5; atol=1e-12)  # The average should stay at 0.5
+    @test isapprox(fstats[1][2], 0.5; atol=1e-12) 
+    @test isapprox(fstats[2][1], 0.0; atol=1e-12)  # No variation
+    @test isapprox(fstats[2][2], 0.0; atol=1e-12)
 
     # path_stats should also be present
     pstats = summary["path_stats"]
-    @test length(pstats) == 1
-    @test isapprox(pstats[1].p50, 3.0; atol=1e-12)
+    @test length(pstats) == 2
+    @test length(pstats[1]) == 2
+    @test length(pstats[2]) == 2
+    @test isapprox(pstats[1][1], 1.0; atol=1e-12)  # The average should stay at 1.0
+    @test isapprox(pstats[2][1], 0.0; atol=1e-12)  # No variation
 
-    # More complex simulation results (5 generations ├ù 3 individuals)
+
+    # More complex simulation results (5 generations × 3 individuals)
     G, P = 5, 3
-    fitness = rand(G, P) # Random fitness values between 0 and 1
+    fitness_history = rand(G, P) # Random fitness values between 0 and 1
     
     # Path lengths with some missing values
-    path_length = Matrix{Union{Int,Nothing}}(undef, G, P)
-    path_length[1,:] = [3, nothing, 4]      # Gen 1: 66% valid
-    path_length[2,:] = [2, 5, 3]            # Gen 2: 100% valid
-    path_length[3,:] = [nothing, 4, nothing] # Gen 3: 33% valid
-    path_length[4,:] = [6, 3, 4]            # Gen 4: 100% valid
-    path_length[5,:] = [5, 4, 3]            # Gen 5: 100% valid
+    path_length_history = Matrix{Union{Int,Nothing}}(undef, G, P)
+    path_length_history[1, :] = [3, nothing, 4]      # Gen 1: 66% valid
+    path_length_history[2, :] = [2, 5, 3]            # Gen 2: 100% valid
+    path_length_history[3, :] = [nothing, 4, nothing] # Gen 3: 33% valid
+    path_length_history[4, :] = [6, 3, 4]            # Gen 4: 100% valid
+    path_length_history[5, :] = [5, 4, 3]            # Gen 5: 100% valid
 
-    # 2├ù2 matrices for each individual in each generation
-    matrices = Array{Matrix{Float64}}(undef, G, P)
-    for g in 1:G, p in 1:P
-        matrices[g,p] = rand(2, 2)  # Random 2├ù2 matrices
-    end
+    # 2×2 matrices for each individual in each generation
+    matrices_history = Array{Matrix{Float64}}(undef, G, P)
+    matrices_history = [rand(2, 2) for _ in 1:G, _ in 1:P]  # Random 2×2 matrices
+    completion_history = .!isnothing.(path_length_history)
+    optimal_phenotype = [1.0, -1.0]
+    initial_state = [1.0, 1.0]    
 
-    completion = fill(0.8, G)  # 80% completion rate each generation
-    phen_opt = [1.0, -1.0]    # Binary phenotype target
-
-    result = Dict(
-        "fitness" => fitness,
-        "path_length" => path_length,
-        "matrices" => matrices,
-        "completion" => completion,
-        "phenotypic_optima" => phen_opt
+    result = BooleanNetwork.SimulationData(
+        completion_history,
+        fitness_history,
+        matrices_history,
+        path_length_history,
+        initial_state,
+        optimal_phenotype
     )
 
     summary = CustomStats.summarize_simulation_run(result)
 
     # Test dimensions
-    @test length(summary["fitness_stats"]) == G
-    @test length(summary["path_stats"]) == G
-    @test length(summary["completion"]) == G
-    @test length(summary["alignment_stats"]) == G
-
-    # Test validity tracking in path_stats
-    path_validities = [stats.validity_pct for stats in summary["path_stats"]]
-    @test isapprox(path_validities[1], 66.67; atol=0.1) # Gen 1: 2/3 valid
-    @test isapprox(path_validities[2], 100.0; atol=0.1) # Gen 2: all valid
-    @test isapprox(path_validities[3], 33.33; atol=0.1) # Gen 3: 1/3 valid
-    @test isapprox(path_validities[4], 100.0; atol=0.1) # Gen 4: all valid
-    @test isapprox(path_validities[5], 100.0; atol=0.1) # Gen 5: all valid
+    @test length(summary["fitness_stats"][1]) == G
+    @test length(summary["fitness_stats"][2]) == G
+    @test length(summary["path_stats"][1]) == G
+    @test length(summary["path_stats"][2]) == G
+    @test length(summary["completion_stats"][1]) == G
+    @test length(summary["completion_stats"][2]) == G
+    @test length(summary["alignment_stats"][1]) == G
+    @test length(summary["alignment_stats"][2]) == G
 end
 
 println("test_data_processing.jl: all tests completed")

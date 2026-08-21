@@ -1,212 +1,177 @@
+"""
+    Custom Stats
+
+Provides the data analysis tools used in these simulations. It achieves three things:
+1. Summarize data into average and standard deviations per generation across simulations
+2. Compute alignment score per matrix and population
+3. Compute mutational robustness per matrix and population
+
+# Exported functions
+- `summarize_history`: Computes the average and sample standard deviation of data with shape
+    (generations, pop_size) into two vectors of size generations
+- `alignment_score`: Computes the alignment score of a marix, returning a Float64. To use in
+    a grid of matrices, use broadcasting as alignment_score.(grid_matrices, Ref(vector)).
+- `mutational_robustness`: Computes the mutational robustness metrics of a matrix and returns
+    a Tuple of four Float64. To use in a grid of matrices, use broadcasting as
+    mutational_robustness.(grid_matrices,Ref(...))
+
+# Notes
+- mutational_robustness_pop takes samples across time and population sizes because it is very
+    expensive to run. 
+- The module does not use parallel processing because threads are dedicated to running
+    multiple experiments. 
+"""
 module CustomStats
 
-using Statistics
-using StatsBase 
 using Distributions
 using LinearAlgebra
 using Random
-using Base.Threads
 
-# Include core simulation functionality
-include("wagner_algorithm.jl")
-using .BooleanNetwork
+include("../src/wagner_algorithm.jl")
+using .BooleanNetwork  # SimulationData, SimulationParameters
+#  TODO - Corroborate if this is appropriate. I want to specify the structure I am using, and
+#   importing the entire module at the same time?
 
-export
-    # Simulation summary functions
-    summarize_simulation_run, 
-    compute_fitness_stats, # TODO - Deprecate or apply in a generalized form. 
-    compute_path_stats, # ''
-    compute_alignment_stats, # '' 
-    compute_all_alignments,
-    # Population analysis functions
-    compute_mut_robustness,
-    compute_population_mut_robustness
-    # Future features
-    # compute_network_motifs  # TODO: Implement motif analysis
+using StatsBase: mean, std, var
 
-# Type aliases for clarity
-const SimulationMatrix = Matrix{Float64}
-const GenerationSummary = NamedTuple{
-    (:mean, :p5, :p25, :p50, :p75, :p95, :validity_pct),
-    Tuple{Float64, Float64, Float64, Float64, Float64, Float64, Float64}
-}
-const MutationalRobustnessSummary = NamedTuple{
-    (:stable_expression_shift, :stable_expression_variance, :unstable_probability_shift, :unstable_probability_variance),
-    Tuple{Float64, Float64, Float64, Float64}
-}
+export summarize_history, alignment_score, mutational_robustness_pop
 
     """
-        compute_percentile_stats(data::AbstractVector{<:Real}) -> GenerationSummary
+        summarize_history(data::AbstractArray) -> Tuple {Vector{Float64}, Vector{Float64}}
 
-    Compute mean, percentiles (5,25,50,75,95), and percentage of valid datapoints 
-    for a generation's data skipping missing data. 
+    Summarizes the data of an abstract matrix of size (generations, pop_size) in their mean
+    and sample standard deviation. It excludes "nothing" values. 
 
-    Returns a NamedTuple with fields: mean, p5, p25, p50, p75, p95, validity
+    # Arguments
+    - `data::AbstractMatrix`: Abstract matrix holding the data, that can be fitness, path 
+        length, or alignment score.
+    
+    # Returns
+    A tuple containing:
+    - `Vector{Float64}`: Averages with size generations
+    - `Vector{Float64}`: Sample standard deviation with size generations. 
+
+    # Notes
+    - It ignores nothing values, so [1.0, 2.0, nothing] will be taken as [1.0, 2.0]
+    - Output vectors might contain NaN if there are not enough data points! 
+    - Standard error is SEM = σ/√N, where σ is the sample std and N the sample size
     """
-    function compute_percentile_stats(data::AbstractVector{<:Union{Real,Nothing}})::GenerationSummary
-        valid_data = filter(!isnothing, data)
-        validity = if isempty(data)
-            # If the original input was empty, it's 100% "valid" (empty)
-            100.0
-        else
-            length(valid_data) / length(data) * 100.0
+    function summarize_history(data::AbstractMatrix)::Tuple{Vector{Float64}, Vector{Float64}}
+        n_rows = size(data)[1]
+        means = Vector{Float64}(undef, n_rows)
+        stds = Vector{Float64}(undef, n_rows)
+
+        for row_idx in 1:n_rows
+            row_view = @view data[row_idx,:]
+            filtered_data = filter(!isnothing, row_view)
+            n = length(filtered_data)
+
+            if n == 0
+                means[i] = NaN
+                stds[i]  = NaN
+            elseif n == 1
+                means[i] = filtered_data[1]
+                stds[i]  = NaN  
+            else
+                means[i] = mean(filtered_data)
+                stds[i]  = std(filtered_data; corrected=true)
+            end
         end
-
-        if isempty(valid_data)
-            @warn "No valid data points found ($(round(validity, digits=1))% valid)"
-            # Return default values, now with `validity_pct`
-            return (mean=0.0, p5=0.0, p25=0.0, p50=0.0, p75=0.0, p95=0.0, validity_pct=validity)
-        end
-
-        if validity < 100
-            @info "Computing stats on $(round(validity, digits=1))% of data points"
-        end
-
-        return (
-            mean=mean(valid_data),
-            p5=percentile(valid_data, 5),
-            p25=percentile(valid_data, 25),
-            p50=percentile(valid_data, 50),
-            p75=percentile(valid_data, 75),
-            p95=percentile(valid_data, 95),
-            validity_pct=validity 
-        )
-    end
-    """
-        compute_fitness_stats(fitness_matrix::Matrix{Float64}) -> Vector{GenerationSummary}
-
-    Compute per-generation fitness statistics including mean and percentiles.
-    """
-    function compute_fitness_stats(fitness_matrix::Matrix{Float64})::Vector{GenerationSummary}
-        return [compute_percentile_stats(fitness_matrix[gen, :]) 
-                for gen in axes(fitness_matrix, 1)]
+        return (means, stds)
     end
 
     """
-        compute_path_stats(path_matrix::Matrix) -> Vector{GenerationSummary}
-
-    Compute per-generation path length statistics, handling nothing values.
-    """
-    function compute_path_stats(path_matrix::Matrix)::Vector{GenerationSummary}
-        return [compute_percentile_stats(path_matrix[gen, :])
-                for gen in axes(path_matrix, 1)]
-    end
-
-    """
-        compute_alignment_score(matrix::AbstractMatrix, vector::AbstractVector) -> Float64
+        alignment_score(matrix::Matrix{Float64}, vector::Vector{Float64}) -> Float64
 
     Compute alignment between a matrix's rows and a target vector using normalized dot products.
+
+    # Arguments
+    - `matrix::Matrix{Float64}`: A matrix whose weights represent gene-gene interactions
+    - `vector::Vector{Float64}`: A vector from where alignment score will be computed 
+
+    # Returns
+    - `Float64`: The alignment score of the given matrix
+
+    # Notes
+    - It is possible to broadcast to a grid of matrices by setting Ref(vec)
     """
-    function compute_alignment_score(matrix::AbstractMatrix, vector::AbstractVector)::Float64
-        n_rows = size(matrix, 1)
-        scores = zeros(n_rows)
-        
-        for i in 1:n_rows
-            row = view(matrix, i, :)
-            row_norm = norm(row, 1)  # L1 norm
-            scores[i] = iszero(row_norm) ? 0.0 : dot(row, vector) / row_norm
+    function alignment_score(matrix::Matrix{Float64}, vector::Vector{Float64})::Float64
+        normalized_mat = mapslices(matrix; dims=2) do row  # Normalize rows by their L1 norms
+            row_norm = norm(row, 1)
+            iszero(row_norm) ? row : row / row_norm  # Leave as empty if it was empty
         end
-        
-        return dot(scores, vector) / length(vector)
+
+        return dot(vector, normalized_mat, vector)  # vector^T * normalized_mat * vector
     end
-
-    """
-        compute_alignment_stats(matrices::AbstractArray{Matrix{Float64}}, 
-                            target::Vector) -> Vector{GenerationSummary}
-
-    Compute per-generation alignment statistics for a population of matrices.
-    """
-    function compute_alignment_stats(
-        matrices::AbstractArray{Matrix{Float64}}, 
-        target::Vector
-    )::Vector{GenerationSummary}
-        n_gens = size(matrices, 1)
-        alignments = [Float64[] for _ in 1:n_gens]
-        
-        for gen in 1:n_gens
-            gen_alignments = [compute_alignment_score(matrices[gen, i], target) 
-                            for i in axes(matrices, 2)]
-            alignments[gen] = gen_alignments
-        end
-        
-        return [compute_percentile_stats(gen_align) for gen_align in alignments]
-    end
-    """
-        compute_alignment_stats(matrices::AbstractArray{Matrix{Float64}}, 
-                            target::Vector) -> Vector{GenerationSummary}
-
-    Compute per-generation alignment score for a population of matrices.
-    """
-    function compute_all_alignments(
-        matrices::AbstractArray{Matrix{Float64}},
-        target::Vector
-    )::Matrix{Float64}
-        return map(M -> compute_alignment_score(M, target), matrices)
-    end
-
 
     """
         summarize_simulation_run(result::Dict) -> Dict
 
-    Compute comprehensive statistics for a simulation run.
+    Wrapper for the main statistics of a run. 
 
     Returns a dictionary with keys:
     - fitness_stats: Vector of per-generation fitness statistics
     - path_stats: Vector of per-generation path length statistics
-    - completion: Vector of per-generation completion rates
+    - completion_stats: Vector of per-generation completion rates
     - alignment_stats: Vector of per-generation alignment statistics
-    """
-    function summarize_simulation_run(result::Dict)::Dict
+    """  
+    function summarize_simulation_run(result::SimulationData)::Dict
+        alignment_scores_population = alignment_score.(result.matrices_history, 
+            Ref(result.optimal_phenotype))
         return Dict(
-            "fitness_stats" => compute_fitness_stats(result["fitness"]),
-            "path_stats" => compute_path_stats(result["path_length"]),
-            "completion" => result["completion"],
-            "alignment_stats" => compute_alignment_stats(
-                result["matrices"], 
-                result["phenotypic_optima"]
-            )
+            "fitness_stats" => summarize_history(result.fitness_history),
+            "path_stats" => summarize_history(result.path_length_history),
+            "completion_stats" => (mean(result.completion_history), 
+                std(result.completion_history; corrected=true)),
+            "alignment_stats" => summarize_history(alignment_scores_population)
         )
     end
 
     """
         generate_expression_distribution(matrix::Matrix{Float64}, 
-                            initial_state::Vector{Int},
-                            n_noise_masks::Int,
+                            initial_state::Vector{Float64},
+                            number_noise_samples::Int,
                             noise_dist::Distribution,
-                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
-                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
-                            activation=BooleanNetwork.activation)
+                            max_steps::Int,  # Default: simulation parameter
+        )::Tuple{Vector{Float64}, Float64}
 
-    Generates a sample from the expression distribution for a given matrix
-    using the noise distribution. 
+    Generates a sample from the expression distribution for a given matrix using a specified
+    noise distribution
 
-    Returns a tuple
-    - avg_stable_expression: A vector with the average expression of each gene
-        in the expression distribution
-    - unstable_proportion: The proportion of times the expressed phenotype was unstable
+    # Returns
+    A tuple containing: 
+    - avg_stable_expression: The sampled average expression vector.
+    - unstable_proportion: The fraction of times the expressed phenotype was unstable.
+
+    # Notes
+    - stable_count helps keep track of the index at which the last stable state was stored
+
+    # TODO
+    - Ensure compatibility with asynchornous development. 
+    - Ensure compatibility with different activation functions. 
     """
 
     function generate_expression_distribution(matrix::Matrix{Float64}, 
-                            initial_state::Vector{Int},
-                            n_noise_masks::Int,
+                            initial_state::Vector{Float64},
+                            number_noise_samples::Int,
                             noise_dist::Distribution,
-                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
-                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
-                            activation=BooleanNetwork.activation)
-        N_genes = size(matrix, 1)
-        stable_states = Matrix{Float64}(undef, n_noise_masks, N_genes)
-        stable_count = 0
+                            max_steps::Int=SimulationParameters.max_steps,
+    )::Tuple{Vector{Float64}, Float64}
+        number_genes = size(matrix, 1)
         unstable_count = 0
-        buffer_matrix = Matrix{Float64}(undef, N_genes, N_genes)
+        stable_count = 0
+        stable_states = Matrix{Float64}(undef, number_noise_samples, number_genes)
+        buffer_matrix = Matrix{Float64}(undef, number_genes, number_genes)
+        buffer_vec_1 = Vector{Float64}(undef, number_genes)
+        buffer_vec_2 = Vector{Float64}(undef, number_genes)  # Memory allocation
 
-        for idx in 1:n_noise_masks
+        for idx in 1:number_noise_samples
             copyto!(buffer_matrix, matrix)
             BooleanNetwork.apply_noise!(buffer_matrix, noise_prob, noise_dist)
+            final_state, _ = BooleanNetwork.develop(buffer_matrix, initial_state, max_steps;
+                buffer1=buffer_vec_1, buffer2=buffer_vec_2)
 
-            final_state, _ = BooleanNetwork.develop(buffer_matrix, initial_state, max_steps, activation)
-            # final_state, _ = BooleanNetwork.develop_asynchronous(buffer_matrix, initial_state, max_steps, activation)
-
-            if final_state !== nothing
+            if !isnothing(final_state)
                 stable_count += 1
                 stable_states[stable_count, :] = final_state
             else
@@ -215,137 +180,107 @@ const MutationalRobustnessSummary = NamedTuple{
         end
 
         if stable_count == 0
-            avg_stable_expression = zeros(Float64, N_genes)
+            avg_stable_expression = zeros(Float64, number_genes)
+            # No stable expression was found in this sample, so we assume every state is
+            # equally likely to be a stable state
         else
             avg_stable_expression = vec(mean(view(stable_states, 1:stable_count, :); dims=1))
+            # Average across the number of stable states that were sampled
         end
 
-        return avg_stable_expression, unstable_count / n_noise_masks
+        return avg_stable_expression, unstable_count / number_noise_samples
     end
 
     """
-        compute_mut_robustness(matrix::Matrix{Float64}, 
-                            initial_state::Vector{Int},
-                            n_mutations::Int,
-                            n_noise_masks::Int,
-                            noise_dist::Distribution;
-                            mut_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS.pr,
-                            mr::Float64=BooleanNetwork.STANDARD_PARAMETERS.mr,
-                            ؟r::Float64=BooleanNetwork.STANDARD_PARAMETERS.؟r,
-                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS.noise_prob,
-                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS.max_steps,
-                            activation=BooleanNetwork.activation)::MutationalRobustnessSummary
+        compute_mut_robustness(
+            matrix::Matrix{Float64},  # Matrix to test mutational robustness from 
+            initial_state::Vector{Float64},  # Development begins using this state
+            number_mutation_samples::Int,  # Number of mutations
+            number_noise_samples::Int,  # Number of samples in the expression the distribuition
+            noise_dist::Distribution;  # Factor multiplying each weight in the matrix
+            mutation_prob::Float64,  # Probability that a weight is resampled (independently)
+            weights_dist::Distribution,  # Matrix weights will be resampled from here
+                Default: simulation parameter
+            max_steps::Int,  # Max steps in development. Default: simulation parameter
+            )::NamedTuple{stable_expression_shift::Float64, stable_expression_var::Float64,
+                unstable_prob_shift::Float64, unstable_prob_var::Float64}
 
-    Estimate the mutational robustness of a regulatory matrix by repeatedly
-    mutating its non-zero entries, simulating noisy dynamics, and aggregating
-    how much the stable expression profile and instability probability shift
-    relative to the unmutated baseline.
+    Estimate the mutational robustness of a regulatory matrix by repeatedly mutating its 
+    non-zero entries, simulating noisy dynamics, and aggregating how much the stable 
+    expression distribution sample summary statistics differ relative to the non-mutated
+    baseline.
 
     Returns a `NamedTuple` with:
-    - `mean_expression_shift`: average absolute difference between the baseline
-      and mutated average stable expression vectors (averaged over mutations).
-    - `mean_unstable_shift`: average absolute difference in the probability of converging to
-      an unstable phenotype after mutation (mutated minus baseline).
+    - `stable_expression_shift`: average absolute difference between the baseline and 
+    mutated average stable expression vectors (averaged over mutations).
+    - `stable_expression_var`: total sample variance in the expressed phenotypes average 
+        expression from mutated phenotypes
+    - `unstable_prob_shift`: average difference in the probability of converging to
+      an unstable phenotype after mutation relative to baseline.
+    - `unstable_prob_var`: variance in the probaiblity of converging to an unstable
+    phenotype from mutated matrices.
+
+    # Throws
+    - `ArgumentError` if number_mutation_samples or number_noise_samples are less than or
+        equal to 1.
+
+    # Notes
+    - Can broadcast to a grid of matrices by using compute_mut_robustness.(grid_matrices, 
+    Ref(initial_state), Ref(number_mutation_samples), ...)
+
+    # TODO:
+    - Ensure compatibility with asynchronous development and different activation functions
     """
-    function compute_mut_robustness(matrix::Matrix{Float64}, 
-                            initial_state::Vector{Int},
-                            n_mutations::Int,
-                            n_noise_masks::Int,
-                            noise_dist::Distribution;
-                            mut_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["pr"],
-                            mr::Float64=BooleanNetwork.STANDARD_PARAMETERS["mr"],
-                            sigma_r::Float64=BooleanNetwork.STANDARD_PARAMETERS["σr"],
-                            noise_prob::Float64=BooleanNetwork.STANDARD_PARAMETERS["noise_prob"],
-                            max_steps::Int=BooleanNetwork.STANDARD_PARAMETERS["max_steps"],
-                            activation=BooleanNetwork.activation)::MutationalRobustnessSummary
-        if n_mutations <= 1
-            error("n_mutations must be larger than 1!") # Raises an ErrorException
-        end
+    function compute_mut_robustness(
+        matrix::Matrix{Float64}, 
+        initial_state::Vector{Float64},
+        number_mutation_samples::Int,
+        number_noise_samples::Int,
+        noise_dist::Distribution;
+        mutation_prob::Float64, 
+        weights_dist::Distribution=SimulationParameters.weights_dist,
+        max_steps::Int=SimulationParameters.max_steps,
+    )::NamedTuple{stable_expression_shift::Float64, stable_expression_var::Float64,
+        unstable_prob_shift::Float64, unstable_prob_var::Float64}
+        number_mutation_samples > 1 ||
+            throw(ArgumentError("number_mutations_samples must be larger than 1! Got " *
+                "$number_mutation_samples"))
+        number_noise_samples > 1 ||
+            throw(ArgumentError("number_noise_samples must be larger than 1! Got " *
+                                "$number_mutation_samples"))
 
-        mutation_dist = Normal(mr,sigma_r)
-        n_genes = size(matrix, 1)
-        baseline_mean, baseline_unstable_prob = generate_expression_distribution(
-            matrix,
-            initial_state,
-            n_noise_masks,
-            noise_dist,
-            noise_prob,
-            max_steps,
-            activation
-        )
+        number_genes = size(matrix, 1)
+        baseline_mean, baseline_unstable_prob = generate_expression_distribution(matrix,
+            initial_state, number_noise_samples, noise_dist, max_steps)
 
-        stable_expressions = Matrix{Float64}(undef, n_mutations, n_genes)
-        # avg_stable_shift = Vector{Float64}(undef, n_mutations)
-        unstable_probabilities = Vector{Float64}(undef,n_mutations)
-        mutated_matrix = Matrix{Float64}(undef, n_genes, n_genes)
+        unstable_probs = Vector{Float64}(undef, number_mutation_samples)
+        stable_expressions = Matrix{Float64}(undef, number_mutation_samples, number_genes)
+        mutated_matrix = Matrix{Float64}(undef, number_genes, number_genes)
 
-        for mutation_idx in 1:n_mutations
+        for mutation_idx in 1:number_mutation_samples
             copyto!(mutated_matrix, matrix)
-            BooleanNetwork.reg_mutation!(mutated_matrix, mut_prob, mutation_dist)
-
+            BooleanNetwork.mutation!(mutated_matrix, mutation_prob, mutation_dist)
+            
             mutated_mean, mutated_unstable_prob = generate_expression_distribution(
-                mutated_matrix, initial_state, n_noise_masks,
-                noise_dist, noise_prob,max_steps,activation
-            )
+                mutated_matrix, initial_state, number_noise_samples, noise_dist, max_steps)
 
-            stable_expressions[mutation_idx,:] = mutated_mean
-            unstable_probabilities[mutation_idx] = mutated_unstable_prob
+            stable_expressions[mutation_idx,:] .= mutated_mean
+            unstable_probs[mutation_idx] .= mutated_unstable_prob
         end
 
-        # Mean across mutations
         mean_stable_expression_mutations = vec(mean(stable_expressions, dims=1))
+        stable_expression_var = sum(var(stable_expressions, dims=1, corrected=true))
+        mean_unstable_prob_mutations = mean(unstable_probs)
+        unstable_prob_var = var(unstable_probs, corrected=true)
+
         stable_expression_shift = norm(baseline_mean - mean_stable_expression_mutations,1)
-
-        # Variance across mutations, per entry
-        variances_stable_expression_mutations= var(stable_expressions, dims = 1, corrected = true)
-        stable_expression_variance = sum(variances_stable_expression_mutations)
-
-        # Mean across mutations
-        mean_unstable_prob_mutations = mean(unstable_probabilities)
-        unstable_probability_shift = baseline_unstable_prob - mean_unstable_prob_mutations
-
-        # Variance across mutations
-        unstable_probability_variance = var(unstable_probabilities, corrected = true)
+        unstable_prob_shift = baseline_unstable_prob - mean_unstable_prob_mutations
 
         return (
             stable_expression_shift = stable_expression_shift,
-            stable_expression_variance = stable_expression_variance,
-            unstable_probability_shift = unstable_probability_shift,
-            unstable_probability_variance = unstable_probability_variance
+            stable_expression_var = stable_expression_var,
+            unstable_prob_shift = unstable_prob_shift,
+            unstable_prob_var = unstable_prob_var
         )
-    end   
-
-    """
-        compute_population_mut_robustness(matrices::AbstractArray{Matrix{Float64}}, 
-                                        initial_state::Vector{Int},
-                                        n_mutations::Int,
-                                        n_noise_masks::Int,
-                                        noise_dist::Distribution; kwargs...) 
-            -> Array{MutationalRobustnessSummary}
-
-    Compute mutational robustness for every matrix in `matrices`, returning an
-    array of `MutationalRobustnessSummary` with the same shape as the input.
-    """
-    function compute_population_mut_robustness(
-        matrices::AbstractArray{Matrix{Float64}},
-        initial_state::Vector{Int},
-        n_mutations::Int,
-        n_noise_masks::Int,
-        noise_dist::Distribution;
-        kwargs...
-    )::Array{MutationalRobustnessSummary}
-        result = similar(matrices, MutationalRobustnessSummary)
-        for idx in eachindex(matrices)
-            result[idx] = compute_mut_robustness(
-                matrices[idx],
-                initial_state,
-                n_mutations,
-                n_noise_masks,
-                noise_dist;
-                kwargs...
-            )
-        end
-        return result
-    end 
-
+    end  # PROGRESS MARK: AUGUST 17, 2026
 end # module

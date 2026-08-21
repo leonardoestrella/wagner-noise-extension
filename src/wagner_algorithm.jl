@@ -3,17 +3,18 @@
 
 Provides tools and structures to run an evolutionary algorithm of gene-regulatory networks
 
-# Exported structures and functions
+# Exported structures
 - `SimulationParameters`: Holds the parameters of the simulation. See # Fields
 - `SimulationData`: The results of a simulation. 
 
+# Exported functions
 - `run_simulation`: Executes a single simulation run with a given set of parameters
 
 # Notes
-- It is based on Wagner (1996). Modifications and extensions include more types of initial
-    populations, noisy gene-gene interactions, and different types of selection
-- It does not use parallel processing because threads are dedicated to running multiple
-    experiments simultaneously
+- The module is based on Wagner (1996). Modifications and extensions include more types of 
+    initial populations, noisy gene-gene interactions, and different types of selection.
+- The module does not use parallel processing because threads are dedicated to running 
+    multiple experiments simultaneously.
 """
 module BooleanNetwork
 
@@ -121,10 +122,10 @@ const valid_selection_types = [:wagner, :roulette]
     - Add regulator genes (not directly selected)
     """
     @kwdef mutable struct SimulationData
-        completion_history::Vector{Int}
+        completion_history::Vector{Float64}
         fitness_history::Matrix{Float64}
         matrices_history::Array{Matrix{Float64}}
-        path_length_history::Matrix{Any}
+        path_length_history::Matrix{Union{Float64, Nothing}}
         initial_state::Vector{Float64}
         optimal_phenotype::Vector{Float64}
     end
@@ -525,7 +526,7 @@ const valid_selection_types = [:wagner, :roulette]
             Vector{Matrix{Float64}},  # offspring
             Vector{Float64},          # fitness
             Vector{Any},              # steps
-            Int,                      # completion_gen
+            Float64,                  # completion_gen
         }
 
     Generates a new generation of offspring matrices from an existing `ArtificialPop`
@@ -542,7 +543,7 @@ const valid_selection_types = [:wagner, :roulette]
         or parent (Roulette-type selection)
     3. `Vector{Union{Int,Nothing}}`: Number of steps each offspring took to reach a stable 
         state (`nothing` if unstable).
-    4. `Int`: Number of offspring that reached stability (`completion_gen`).
+    4. `Float64`: Fraction of offspring that reached stability (`completion_gen`).
 
     # Notes
     - Offspring are accepted into the new generation with a probability equal to their 
@@ -569,7 +570,7 @@ const valid_selection_types = [:wagner, :roulette]
             selection_pressure, selection_type, unstable_fitness, weights_dist = params
         @unpack matrices, initial_state, optimal_phenotype = pop  # avoid overwriting
         
-        completion_gen = 0
+        completion_gen = 0.0
         fitness = Vector{Float64}(undef, pop_size)
         offspring = Vector{Matrix{Float64}}(undef, pop_size)
         steps = Vector{Union{Int,Nothing}}(undef,pop_size)
@@ -602,7 +603,7 @@ const valid_selection_types = [:wagner, :roulette]
                     end
                 end 
             end
-            completion_gen = pop_size - count(isnothing, steps)
+            completion_gen = 1.0 - count(isnothing, steps) / pop_size
             
             return offspring, fitness, steps, completion_gen
         # ---Roulette selection---
@@ -623,7 +624,7 @@ const valid_selection_types = [:wagner, :roulette]
             parents_indices = sample(1:pop_size, Weights(normalized_fitness), (2,pop_size);
                 replace=true)
             # Choose parents with a probability proportional to their fitness
-            completion_gen = pop_size - count(isnothing, steps)  # stable development
+            completion_gen = 1.0 - count(isnothing, steps) / pop_size  # stable development
 
             for i in 1:pop_size  # Populate next generation
                 parent_i, parent_j = parents_indices[1,i], parents_indices[2,i]
@@ -672,7 +673,7 @@ const valid_selection_types = [:wagner, :roulette]
             unstable_fitness, weights_dist = params
 
         simulation_data = SimulationData(
-            completion_history = zeros(Int, generations),
+            completion_history = zeros(Float64, generations),
             fitness_history = Matrix{Float64}(undef, generations, pop_size),
             matrices_history = Array{Matrix{Float64}}(undef, generations, pop_size),
             path_length_history = Matrix{Any}(undef, generations, pop_size),
@@ -691,7 +692,7 @@ const valid_selection_types = [:wagner, :roulette]
             simulation_data.matrices_history[gen, :] .= offspring
             simulation_data.fitness_history[gen, :] .= fit
             simulation_data.path_length_history[gen, :] .= steps
-            simulation_data.completion_history[gen] = completion
+            simulation_data.completion_history[gen] .= completion / pop_size
 
             return nothing
         end
@@ -714,12 +715,12 @@ const valid_selection_types = [:wagner, :roulette]
                 fit = indiv_fitness(phenotype, population.optimal_phenotype, 
                     selection_pressure, unstable_fitness)
 
-                simulation_data.fitness_history[1,index] = fit
-                simulation_data.path_length_history[1, index] = path_length
-                simulation_data.matrices_history[1, index] = matrix
+                simulation_data.fitness_history[1,index] .= fit
+                simulation_data.path_length_history[1, index] .= path_length
+                simulation_data.matrices_history[1, index] .= matrix
             end
-            simulation_data.completion_history[1] = pop_size - count(isnothing,
-                simulation_data.path_length_history[1,:])
+            simulation_data.completion_history[1] .= 1.0 - count(isnothing,
+                simulation_data.path_length_history[1,:]) / pop_size
             start_gen = 2
         else
             start_gen = 1
@@ -734,4 +735,3 @@ const valid_selection_types = [:wagner, :roulette]
         return simulation_data
     end
 end
-# PROGRESS MARK AUGUST 11, 2026.

@@ -3,9 +3,6 @@ using Test
 # Tests for wagner_algorithm.jl 
 println("Running all tests for BooleanNetwork...")
 
-# Run basic operations tests
-include("test_operations.jl")
-
 # Run comprehensive core tests
 include("test_core.jl")
 

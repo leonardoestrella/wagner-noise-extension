@@ -24,7 +24,6 @@ using Parameters
 using Random
 using StatsBase
 using UnPack
-
 using Base: @kwdef
 
 export SimulationParameters, SimulationData
@@ -49,13 +48,13 @@ const valid_selection_types = [:wagner, :roulette]
     # Fields
     - `generations::Int`: Total number of evolutionary generations to simulate. 
     - `initial_density::Float64`: Initial connectivity density of networks in the population.
-    - `initial_pop_type::String`: Initial population stability.
+    - `initial_pop_type::Symbol`: Initial population stability.
     - `max_steps::Int`: Maximum steps in phenotype expression.
     - `mutation_prob::Float64`: Probability that a weight is mutated in each generation
     - `noise_dist::X`: Probability distribution for interaction strength noise. 
     - `number_genes::Int`: Number of genes per regulatory network. 
     - `pop_size::Int`: Number of individuals in the population. 
-    - `selection_type::String`: Type of selection used to generate new generations of organisms.
+    - `selection_type::Symbol`: Type of selection used to generate new generations of organisms.
     - `selection_pressure::Float64`: Scaling factor determining selection intensity.
     - `unstable_fitness::Float64`: Baseline fitness assigned to unstable network states.
     - `weights_dist::W`: Probability distribution used to sample edge weights. 
@@ -64,13 +63,13 @@ const valid_selection_types = [:wagner, :roulette]
     - add regulatory genes, which are not directly under selective pressure
     - add development mode (a string containing synchronous or asynchronous)
     """
-    @kwdef mutable struct SimulationParameters{W<:Distribution,X<:Distribution}
+    @kwdef mutable struct SimulationParameters{W<:Distribution}
         generations::Int = 500
         initial_density::Float64 = 1.0
         initial_pop_type::Symbol = :stable
         max_steps::Int = 100
         mutation_prob::Float64 = 0.01
-        noise_dist::X = Bernoulli(1.0)  # standard is no noise
+        noise_dist::Distribution = Bernoulli(1.0)  # standard is no noise
         number_genes::Int = 10
         pop_size::Int = 300
         selection_pressure::Float64 = 10.0

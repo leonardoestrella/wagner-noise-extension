@@ -9,6 +9,7 @@ Provides the data analysis tools used in these simulations. It achieves three th
 # Exported functions
 - `summarize_history`: Computes the average and sample standard deviation of data with shape
     (generations, pop_size) into two vectors of size generations
+- `summarize_simulation_run`: Wrapper for summarize_history around fitness, path length, completion
 - `alignment_score`: Computes the alignment score of a marix, returning a Float64. To use in
     a grid of matrices, use broadcasting as alignment_score.(grid_matrices, Ref(vector)).
 - `compute_mut_robustness`: Computes the mutational robustness metrics of a matrix and returns
@@ -20,21 +21,20 @@ Provides the data analysis tools used in these simulations. It achieves three th
     expensive to run. 
 - The module does not use parallel processing because threads are dedicated to running
     multiple experiments. 
+- The module assumes that BooleanNetwork was already loaded in Main.
 """
 module CustomStats
 
 using Distributions
 using LinearAlgebra
 using Random
-
 using StatsBase: mean, std, var
 
 include("../src/wagner_algorithm.jl")
-using ..BooleanNetwork: SimulationData, SimulationParameters
-using ..BooleanNetwork: apply_noise!, develop, mutation!
+using Main.BooleanNetwork: SimulationData, SimulationParameters
+using Main.BooleanNetwork: apply_noise!, develop, mutation!
 
 export summarize_history, summarize_simulation_run, alignment_score, compute_mut_robustness
-
     """
         summarize_history(data::AbstractArray) -> Tuple {Vector{Float64}, Vector{Float64}}
 
@@ -106,7 +106,7 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
     end
 
     """
-        summarize_simulation_run(result::Dict) -> Dict
+        summarize_simulation_run(result::SimulationData) -> Dict
 
     Wrapper for the main statistics of a run. 
 

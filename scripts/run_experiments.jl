@@ -1,121 +1,112 @@
 #!/usr/bin/env julia
 """
-Compute-only runner for the two manuscript experiments.
-Returns experiment results without plotting or saving figures.
-"""
+    ExperimentHandler
 
-"""
-JULY 28, 2026 - It is currently under refactoring. Leo will delete
-plot_payload to simplify code, and will use JLD2
-"""
+Compute-only runner for the two manuscript experiments. Returns experiment results without
+plotting or saving figures.
 
+# Exported structures
+- `Experiment1Config`: Sets up the configurations for experiment 1. See # Fields
+- `Experiment2Config`: Sets up the configurations for experiment 2. See # Fields
+- `Experiment1Result`: Contains the results of experiment 1. 
+- `Experiment2Result`: Contains the results of experiment 2.
+- `MotifStats`: Holds summary statistics for network motif counts
+
+# Exported functions:
+- `run_experiment_1`: Runs experiment 1, consisting of evolving populations across noise
+    noise levels. It computes population level averages and standard deviations of fitness,
+    path lengths, completion, and alignment score. It also computes mutational robustness of
+    a sample of matrices, specified in its configurations. It also stores some matrices, 
+    specified at the sample points and sample sizes, for further processing.
+- `run_experiment_2`: Runs experiment 2, consisting of producing different types of
+    populations (random, evolved without noise, and evolved with high noise) and getting the
+    average network motif counts found in each population.
+- `build_noise_scenarios`: Builds a vector of different noise levels and their labels. 
+
+# Notes
+- Uses Threads for parallel processing.
+- The module assumes BooleanNetwork was already loaded in Main.  
+"""
 module ExperimentHandler
 
+using Base.Threads
 using Distributions
-using Statistics
-using StatsBase
-using Random
+using LinearAlgebra
 using Printf
 using ProgressMeter
-using JSON3
-using StructTypes
-import PyCall
+using Random
+using StatsBase
+using UnPack
 using PyCall: PyVector, pyimport, PyObject
-using LinearAlgebra
-using Base.Threads
 
+include("../src/wagner_algorithm.jl")
+using Main.BooleanNetwork: SimulationData, SimulationParameters
+using Main.BooleanNetwork: run_simulation, initialize_population
+include("../src/data_processing.jl")
+using Main.CustomStats: summarize_history, summarize_simulation_run, alignment_score, 
+    compute_mut_robustness
 
-export run_experiment1, run_experiment2, Experiment1Config, Experiment2Config, build_noise_scenarios
-export save_experiment_results, load_experiment_results
+export Experiment1Config, Experiment2Config, Experiment1Result, Experiment2Result, MotifStats
+export run_experiment_1, run_experiment_2, build_noise_scenarios
 
     const ROOT_DIR = normpath(joinpath(@__DIR__, ".."))
-
-    include(joinpath(ROOT_DIR, "src", "wagner_algorithm.jl"))
-    using .BooleanNetwork
-    include(joinpath(ROOT_DIR, "src", "data_processing.jl"))
-    using .CustomStats # obtains population-level statistics
-
-    # Make sure PyCall can import motif_search.py that lives under src/.
     const PY_SRC_PATH = joinpath(ROOT_DIR, "src")
-
     const PY_SYS_PATH = PyVector(pyimport("sys")["path"])
+
     if !(PY_SRC_PATH in PY_SYS_PATH)
         push!(PY_SYS_PATH, PY_SRC_PATH)
     end
-    const MotifSearch = pyimport("motif_search")
+
+    const MotifSearch = pyimport("motif_search")  # motif_search.py
     const PyBuiltins = pyimport("builtins")
     const FFL_TYPES = collect(String.(PyVector(MotifSearch["FFL_loops_names"])))
 
     # ------------------------------------------------------------------
-    # Experiment 1 helpers
+    # Experiment 1
     # ------------------------------------------------------------------
-
     struct NoiseScenario
         label::String
         variance::Float64
         distribution::Distribution
     end
 
-    Base.@kwdef struct Experiment1Config #TODO - replace with a "loader" in each experiment
-        generations::Int = 500 # 500
-        pop_size::Int = 300 # 300
-        mode::String = "stable"
-        trials::Int = 30 # 30
-        thetas::Vector{Float64} = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
-        robustness_n_mutations::Int = 5
-        robustness_n_noise_masks::Int = 30
+    Base.@kwdef struct Experiment1Config
+        # SimulationParameters
+        simulation_parameters::SimulationParameters = SimulationParameters()
+
+        # Variables
+        number_mutation_samples::Int = 5
+        number_noise_samples::Int = 30
+        sample_points::Vector{Int} = [1,500]
+        sample_sizes:: Int = 30
         standard_noise::Distribution = Gamma(1.0,1.0)
-        N_target::Int = 10
-        # TODO - incorporate type of initial network topology and connectivity
+        thetas::Vector{Float64} = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+        trials::Int = 30
     end
 
-    struct PopulationRobustnessSummary # TODO - revise with theoretical discussion in methods section
-        stable_expression_shift_population::Matrix{Float64}
-        stable_expression_variance_population::Matrix{Float64}
-        unstable_probability_shift_population::Matrix{Float64}
-        unstable_probability_variance_population::Matrix{Float64}
-    end
-
-    struct Experiment1Result
+    struct Experiment1Result  # Do not delete. Serves as a reference in the data analysis
         scenarios::Vector{NoiseScenario}
-        averages::Dict{Symbol,Matrix{Float64}}
-        sems::Dict{Symbol,Matrix{Float64}}
-        stds::Dict{Symbol,Matrix{Float64}}
-        sizes::Dict{Symbol,Matrix{Float64}}
-        final_alignments::Matrix{Float64}
-        initial_robustness::PopulationRobustnessSummary
-        final_robustness::PopulationRobustnessSummary
-        #TODO - add samples of matrices from populations in the generation
-        config::Experiment1Config
+
+        # Summary statistics mapped by metric keys (:avg, :std, :sem, :size).
+        # Each Matrix{Float64} has dimensions: (n_scenarios, generations), 
+        # aggregated across trials and populations.
+        fitness::Dict{Symbol, Matrix{Float64}}
+        path_length::Dict{Symbol, Matrix{Float64}}
+        completion::Dict{Symbol, Matrix{Float64}}
+        alignment::Dict{Symbol, Matrix{Float64}}
+
+        # Sampled population matrices indexed by coordinate.
+        # Array dimensions: (n_scenarios, trials, sample_points, sample_sizes).
+        matrix_samples::Array{Matrix{Float64}, 4}
+
+        # Population-level mutational robustness metrics.
+        # Each Array{Float64, 3} has dimensions: (n_scenarios, trials, sample_points),
+        # aggregated across samples ⊂ populations.
+        mut_rob::NamedTuple{
+            (:stable_expression_shift, :stable_expression_var, :unstable_prob_shift, :unstable_prob_var),
+            NTuple{4,Array{Float64,3}}
+        }
     end
-
-    # ------------------------------------------------------------------
-    # Experiment 2 helpers
-    # ------------------------------------------------------------------
-
-    Base.@kwdef struct Experiment2Config
-        trials::Int = 30 # 30
-        max_loop_size::Int = 5 # 5
-        sample_size::Int = 30 # 30
-    end
-
-    struct MotifStats # TODO - revise with motif-search algorithms
-        ffl::Dict{String, Vector{Float64}}
-        fbcks_reinf::Dict{Int, Vector{Float64}}
-        fbcks_balanc::Dict{Int, Vector{Float64}}
-    end
-
-    struct Experiment2Result
-        random::MotifStats
-        noiseless::MotifStats
-        noisy::MotifStats
-        config::Experiment2Config
-    end
-
-    # ------------------------------------------------------------------
-    # General functions
-    # ------------------------------------------------------------------
-
 
     function build_noise_scenarios(config::Experiment1Config)
         scenarios = NoiseScenario[NoiseScenario("Noiseless", 0.0, Bernoulli(1.0))]
@@ -126,205 +117,182 @@ export save_experiment_results, load_experiment_results
         return scenarios
     end
 
-    function mean_path_length(row) # TODO - This function should already be handled in CustomStats
-        values = Float64[]
-        for val in row
-            if val === nothing || (val isa Missing)
-                continue
-            end
-            num = Float64(val)
-            if isnan(num)
-                continue
-            end
-            push!(values, num)
-        end
-        return isempty(values) ? NaN : mean(values)
-    end
-
     """
-        function column_mean_and_stds
-    
-    computes the mean and standard deviation per column in a data matrix. it ignores
-    the entries with missing values, and counts the number of non-missing values.
-            (THIS MIGHT BE THE SOURCE OF ERROR FOR θ=1.00)
+        aggregate_trials(data::AbstractMatrix{Float64}
+        ) -> NamedTuple{(:avg,:std,:sem,:size), NTuple{4,Vector{Float64}}}
 
-    args
-        - data: a matrix with numerical values
-    returns
-        - means: a vector with the averages
-        - means: a vector with the standard deviations
-        - sizes: a vector with the number of non-missing values per column
+    Summarize a `(trials, generations)` matrix into per-generation statistics across trials,
+    ignoring `NaN` entries (which arise, e.g., when no individual in a trial's population
+    stabilized in a given generation).
+
+    # Arguments
+    - `data`: Matrix of per-trial, per-generation values, shape `(trials, generations)`.
+
+    # Returns
+    A `NamedTuple` with, for each generation:
+    - `avg`: Mean across trials.
+    - `std`: Sample standard deviation across trials.
+    - `sem`: Standard error of the mean, `std / sqrt(size)`.
+    - `size`: Number of non-`NaN` trials.
+
+    # Notes
+    - Entries are `NaN` if there are 0 valid trials, and `std`/`sem` are `NaN` if there is
+        only 1 valid trial.
     """
-    # previously: column_mean_and_sem #TODO - remove this comment
-    function column_mean_and_stds(data::Matrix{Float64}) # This function should already be handled in Custom Stats
-        cols = size(data, 2)
-        means = Vector{Float64}(undef, cols)
-        stds = Vector{Float64}(undef, cols)
-        sizes = Vector{Float64}(undef, cols)
-        for col in 1:cols
-            col_data = view(data, :, col)
-            mask = .!isnan.(col_data)
-            clean = col_data[mask]
-            if isempty(clean)
-                means[col] = NaN
-                stds[col] = NaN
+    function aggregate_trials(
+        data::AbstractMatrix{Float64}
+    )::NamedTuple{(:avg, :std, :sem, :size),NTuple{4,Vector{Float64}}}
+        n_generations = size(data, 2)
+        avg = Vector{Float64}(undef, n_generations)
+        sd = Vector{Float64}(undef, n_generations)
+        sem = Vector{Float64}(undef, n_generations)
+        n = Vector{Float64}(undef, n_generations)
+
+        for gen in 1:n_generations
+            valid = filter(!isnan, view(data, :, gen))
+            count = length(valid)
+            n[gen] = count
+            if count == 0
+                avg[gen], sd[gen], sem[gen] = NaN, NaN, NaN
+            elseif count == 1
+                avg[gen], sd[gen], sem[gen] = valid[1], NaN, NaN
             else
-                means[col] = mean(clean)
-                stds[col] = std(clean) 
-                sizes[col] = length(clean)
+                avg[gen] = mean(valid)
+                sd[gen] = std(valid; corrected=true)
+                sem[gen] = sd[gen] / sqrt(count)
             end
         end
-        return means, stds, sizes
+
+        return (avg=avg, std=sd, sem=sem, size=n)
     end
 
     """
-        run_experiment1(config::Experiment1Config)
+        run_experiment_1(config::Experiment1Config) -> Experiment1Result
 
-    Run the first experiment of the model. 
-    It subjects populations to various levels of noise throughout evolution.
-    It records the average and standard deviation of population's fitness,
-    path length, completion percentages, alignment score, and computes
-    the mutational robustness tuple (initial expression shift, initial unstable shift,
-    final expression shift, initial unstable shift)
+    Run the first experiment of the model. It subjects populations to various levels of
+    noise throughout evolution, recording the average, standard deviation, standard error,
+    and sample size of population fitness, path length, completion percentages, and
+    alignment score per generation, and stores samples of given sizes at some generations.
+    It also computes the mutational robustness tuple (stable expression shift, stable
+    expression variance, unstable probability shift, unstable probability variance) for the
+    sampled matrices, aggregated across the sampled population.
+
+    # Arguments
+    - `config::Experiment1Config`: Experiment configuration, including simulation
+        parameters, the noise scenarios to sweep (via `thetas`), the number of `trials` per
+        scenario, and the sampling settings (`sample_sizes`, `sample_points`).
+
+    # Returns
+    - `Experiment1Result` holding the noise scenarios tested, the per-generation summary
+        statistics for fitness/path length/completion/alignment, the sampled population
+        matrices, and their mutational robustness metrics.
+
+    # Notes
+    - Trials for a given noise scenario run in parallel via `@threads`.
+    - Mutational robustness is only computed for the sampled matrices in `matrix_samples`,
+        since it is expensive to evaluate over the whole population.
     """
-    function run_experiment1(config::Experiment1Config)
+    function run_experiment_1(config::Experiment1Config)::Experiment1Result
+        @unpack generations = config.simulation_parameters
+        @unpack trials, sample_sizes, sample_points, number_mutation_samples,
+        number_noise_samples = config
 
-        # TODO - Add loader of configuration 
-
-        params = deepcopy(BooleanNetwork.STANDARD_PARAMETERS)
-        params["G"] = config.generations
-        params["pop_size"] = config.pop_size
-        params["mode"] = config.mode
-        params["N_target"] = config.N_target
-
-
-        # Pre-allocate variables to hold data
         scenarios = build_noise_scenarios(config)
-        gens = params["G"]
-        metric_names = (:fit, :path, :completion, :alignment)
-        averages = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
-        sems = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
+        n_scenarios = length(scenarios)
+        n_sample_points = length(sample_points)
+        metric_names = (:avg, :std, :sem, :size)
 
-        stds = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
-        sizes = Dict(name => zeros(length(scenarios), gens) for name in metric_names)
+        # Preallocate variables
+        fitness = Dict(name => Matrix{Float64}(undef, n_scenarios, generations) for name in metric_names)
+        path_length = Dict(name => Matrix{Float64}(undef, n_scenarios, generations) for name in metric_names)
+        completion = Dict(name => Matrix{Float64}(undef, n_scenarios, generations) for name in metric_names)
+        alignment = Dict(name => Matrix{Float64}(undef, n_scenarios, generations) for name in metric_names)
+        matrix_samples = Array{Matrix{Float64},4}(undef, n_scenarios, trials, n_sample_points, sample_sizes)
+        mut_rob = (
+            stable_expression_shift=Array{Float64,3}(undef, n_scenarios, trials, n_sample_points),
+            stable_expression_var=Array{Float64,3}(undef, n_scenarios, trials, n_sample_points),
+            unstable_prob_shift=Array{Float64,3}(undef, n_scenarios, trials, n_sample_points),
+            unstable_prob_var=Array{Float64,3}(undef, n_scenarios, trials, n_sample_points)
+        )
 
-        final_alignments = zeros(length(scenarios), config.trials)
-
-        init_stab_expr_shift = zeros(length(scenarios), config.trials)
-        init_stab_expr_var = zeros(length(scenarios), config.trials)
-        init_prob_expr_shift = zeros(length(scenarios), config.trials)
-        init_prob_expr_var = zeros(length(scenarios), config.trials)
-
-        final_stab_expr_shift = zeros(length(scenarios), config.trials)
-        final_stab_expr_var = zeros(length(scenarios), config.trials)
-        final_prob_expr_shift = zeros(length(scenarios), config.trials)
-        final_prob_expr_var = zeros(length(scenarios), config.trials)
-
-        progress = Progress(length(scenarios); desc="Experiment 1 – noise schedules")
+        progress = Progress(n_scenarios; desc="Experiment 1 – noise schedules")
         for (noise_idx, scenario) in enumerate(scenarios)
-            all_fit = zeros(config.trials, gens)
-            all_path = fill(NaN, config.trials, gens)
-            all_completion = zeros(config.trials, gens)
-            all_alignment = zeros(config.trials, gens)
+            all_fit = zeros(trials, generations)
+            all_path = fill(NaN, trials, generations)
+            all_completion = zeros(trials, generations)
+            all_alignment = zeros(trials, generations)
 
-          # Run experiments in parallel
-            @threads for trial_idx in 1:config.trials 
-                # local parameter selection
-                local_params = deepcopy(params)
-                local_params["noise_dist"] = scenario.distribution 
+            @threads for trial_idx in 1:trials
+                local_params = deepcopy(config.simulation_parameters)
+                local_params.noise_dist = scenario.distribution
+                local_data = run_simulation(local_params)
+                local_summary = summarize_simulation_run(local_data)  # Computes averages and
+                # sample standard deviations of the population across timesteps
+                local_sample_matrices = local_data.matrices_history[sample_points,1:sample_sizes]
+                # Sample sample_sizes matrices at generations indicated by sample_points
 
-                exp_data = BooleanNetwork.run_simulation(local_params) # Experiment results
+                all_fit[trial_idx, :] .= local_summary["fitness_stats"][1]
+                all_path[trial_idx, :] .= local_summary["path_stats"][1]
+                all_completion[trial_idx, :] .= local_summary["completion_stats"][1]
+                all_alignment[trial_idx, :] .= local_summary["alignment_stats"][1]
+                matrix_samples[noise_idx, trial_idx, :, :] .= local_sample_matrices
 
-                # extract and compute metrics
-                fitness_run = exp_data["fitness"]
-                path_length_run = exp_data["path_length"]
-                completion = Float64.(exp_data["completion"])
-                alignments = CustomStats.compute_all_alignments(
-                    exp_data["matrices"],
-                    exp_data["phenotypic_optima"]
-                )
+                local_mut_rob = compute_mut_robustness.(local_sample_matrices,
+                    Ref(local_data.initial_state), Ref(number_mutation_samples),
+                    Ref(number_noise_samples), Ref(local_params.noise_dist),
+                    Ref(local_params.mutation_prob); weights_dist=local_params.weights_dist,
+                    max_steps=local_params.max_steps)
+                # Computes mutational robustness metrics per sampled matrix, shape
+                # (n_sample_points, sample_sizes)
 
-                # TODO - Factorize into functions that can be tested
-                avg_fit = vec(mean(fitness_run, dims=2))
-                avg_alignment = vec(mean(alignments, dims=2))
-                path_means = map(mean_path_length, eachrow(path_length_run))
-
-                all_fit[trial_idx, :] = avg_fit
-                all_path[trial_idx, :] = collect(path_means)
-                all_completion[trial_idx, :] = completion
-                all_alignment[trial_idx, :] = avg_alignment
-                final_alignments[noise_idx, trial_idx] = avg_alignment[end]
-
-                initial_pop = collect(exp_data["matrices"][1, :])
-                final_pop = collect(exp_data["matrices"][gens, :])
-                initial_robustness = CustomStats.compute_population_mut_robustness(
-                    initial_pop,
-                    exp_data["initial_state"],
-                    config.robustness_n_mutations,
-                    config.robustness_n_noise_masks,
-                    config.standard_noise;
-                    mut_prob=local_params["pr"],
-                    mr=local_params["mr"],
-                    sigma_r=local_params["σr"],
-                    noise_prob=local_params["noise_prob"],
-                    max_steps=local_params["max_steps"],
-                    activation=BooleanNetwork.activation
-                )
-                final_robustness = CustomStats.compute_population_mut_robustness(
-                    final_pop,
-                    exp_data["initial_state"],
-                    config.robustness_n_mutations,
-                    config.robustness_n_noise_masks,
-                    config.standard_noise;
-                    mut_prob=local_params["pr"],
-                    mr=local_params["mr"],
-                    sigma_r=local_params["σr"],
-                    noise_prob=local_params["noise_prob"],
-                    max_steps=local_params["max_steps"],
-                    activation=BooleanNetwork.activation
-                )
-
-                # TODO - Incorporate in a for loop
-                init_stab_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness,:stable_expression_shift))
-                init_stab_expr_var[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :stable_expression_variance))
-                init_prob_expr_shift[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :unstable_probability_shift))
-                init_prob_expr_var[noise_idx, trial_idx] = mean(getfield.(initial_robustness, :unstable_probability_variance))
-
-                final_stab_expr_shift[noise_idx, trial_idx] = mean(getfield.(final_robustness, :stable_expression_shift))
-                final_stab_expr_var[noise_idx, trial_idx] = mean(getfield.(final_robustness, :stable_expression_variance))
-                final_prob_expr_shift[noise_idx, trial_idx] = mean(getfield.(final_robustness, :unstable_probability_shift))
-                final_prob_expr_var[noise_idx, trial_idx] = mean(getfield.(final_robustness, :unstable_probability_variance))
-
+                for field in keys(mut_rob)
+                    values = getfield.(local_mut_rob, field)
+                    getfield(mut_rob, field)[noise_idx, trial_idx, :] .= vec(mean(values, dims=2))
+                    # Aggregate mutational robustness across the sampled population
+                end
             end
 
-            metric_data = Dict(
-                :fit => all_fit,
-                :path => all_path,
-                :completion => all_completion,
-                :alignment => all_alignment,
-            )
-
-            for metric in (:fit, :path, :completion, :alignment)
-                local_avg, local_std, local_sizes = column_mean_and_stds(metric_data[metric])
-                averages[metric][noise_idx, :] .= local_avg
-                sems[metric][noise_idx, :] .= local_std ./ sqrt.(local_sizes)
-                stds[metric][noise_idx, :] .= local_std
-                sizes[metric][noise_idx, :] .= local_sizes
+            for (metric_dict, data) in (
+                (fitness, all_fit), (path_length, all_path),
+                (completion, all_completion), (alignment, all_alignment)
+            )  # Record the data
+                stats = aggregate_trials(data)
+                for name in metric_names
+                    metric_dict[name][noise_idx, :] .= getfield(stats, name)
+                end
             end
-
-            #TODO - PRIORITY - Sample some of the matrices here
 
             next!(progress)
         end
 
-        initial_summary = PopulationRobustnessSummary(init_stab_expr_shift, init_stab_expr_var, init_prob_expr_shift, init_prob_expr_var)
-        final_summary = PopulationRobustnessSummary(final_stab_expr_shift, final_stab_expr_var, final_prob_expr_shift, final_prob_expr_var)
-        return Experiment1Result(scenarios, averages, sems, stds, sizes, final_alignments, initial_summary, final_summary, config)
+        return Experiment1Result(scenarios, fitness, path_length, completion, alignment,
+            matrix_samples, mut_rob)
+    end
+    # ------------------------------------------------------------------
+    # Experiment 2 
+    # ------------------------------------------------------------------
+    Base.@kwdef struct Experiment2Config
+        # SimulationParameters
+        simulation_parameters::SimulationParameters = SimulationParameters()
+
+        # Variables
+        trials::Int = 30
+        max_loop_size::Int = 5
+        sample_size::Int = 30
+        high_noise_dist::Distribution = Gamma(1.0/8.0, 8.0)
     end
 
-    # ------------------------------------------------------------------
-    # Experiment 2 helpers
-    # ------------------------------------------------------------------
+    struct MotifStats
+        ffl::Dict{String, Vector{Float64}}
+        feedback_reinforcing::Dict{Int, Vector{Float64}}
+        feedback_balancing::Dict{Int, Vector{Float64}}
+    end
+
+    struct Experiment2Result
+        random::MotifStats
+        noiseless::MotifStats
+        noisy::MotifStats
+    end
 
     function ensure_vector!(store::Dict{K, Vector{Float64}}, key::K, trials::Int) where {K}
         if !haskey(store, key)
@@ -332,37 +300,74 @@ export save_experiment_results, load_experiment_results
         end
     end
 
-    function select_matrices(collection, sample_size::Int)
-        # TODO - Remove this function
-        limit = min(sample_size, length(collection))
-        return [Matrix(collection[i]) for i in 1:limit]
+    """
+        sample_matrices(matrices::AbstractVector{<:AbstractMatrix{Float64}}, sample_size::Int
+        ) -> Vector{Matrix{Float64}}
+
+    Take the first `sample_size` matrices from a population, or all of them if the
+    population is smaller than `sample_size`.
+
+    # Arguments
+    - `matrices`: Population of weight matrices to sample from.
+    - `sample_size`: Maximum number of matrices to return.
+
+    # Returns
+    - `Vector{Matrix{Float64}}`: Up to `sample_size` matrices from `matrices`.
+    """
+    function sample_matrices(
+        matrices::AbstractVector{<:AbstractMatrix{Float64}}, sample_size::Int
+    )::Vector{Matrix{Float64}}
+        limit = min(sample_size, length(matrices))
+        return [Matrix(matrices[i]) for i in 1:limit]
     end
 
-    function random_matrix_generator(base_params::Dict, config::Experiment2Config)
-        #TODO - refactor with evolved_matrix_generator into a single function
+    """
+        random_matrix_generator(params::SimulationParameters, config::Experiment2Config) -> Function
+
+    Build a generator that draws a sample of unevolved random matrices, used as a
+    motif-statistics baseline.
+
+    # Arguments
+    - `params::SimulationParameters`: Simulation parameters; `initial_pop_type` should be
+        `:random` so that no stability check is applied.
+    - `config::Experiment2Config`: Experiment configuration, providing `sample_size`.
+
+    # Returns
+    - A zero-argument function returning `(matrices, optimal_phenotype)`.
+    """
+    function random_matrix_generator(params::SimulationParameters, sample_size::Int)
         function generator()
-            phen = sample([1, -1], Weights([base_params["p_phen"], 1 - base_params["p_phen"]]), base_params["N_target"])
-            _, _, matrices = BooleanNetwork.initialize_population(
-                base_params,
-                BooleanNetwork.make_initial_state,
-                BooleanNetwork.make_optimal_phenotype,
-                BooleanNetwork.activation
-            ) #TODO - confusing function name. 
-            return select_matrices(matrices, config.sample_size), phen # TODO - remove select_amatrices (they are already sorted randomly!)
+            _, optimal_phenotype, matrices = initialize_population(params)
+            return sample_matrices(matrices, sample_size), optimal_phenotype
         end
         return generator
     end
 
-    function evolved_matrix_generator(base_params::Dict, dist, config::Experiment2Config)
+    """
+        evolved_matrix_generator(params::SimulationParameters, noise_dist::Distribution,
+            config::Experiment2Config) -> Function
+
+    Build a generator that evolves a population under `noise_dist` and draws a sample of the
+    final generation's matrices.
+
+    # Arguments
+    - `params::SimulationParameters`: Simulation parameters (its `noise_dist` is
+        overridden by `noise_dist` for each generated run).
+    - `noise_dist::Distribution`: Noise distribution applied during evolution.
+    - `config::Experiment2Config`: Experiment configuration, providing `sample_size`.
+
+    # Returns
+    - A zero-argument function returning `(matrices, optimal_phenotype)`.
+    """
+    function evolved_matrix_generator(
+        params::SimulationParameters, noise_dist::Distribution, sample_size::Int
+    )
         function generator()
-            params = deepcopy(base_params)
-            params["noise_dist"] = dist
-            run_data = BooleanNetwork.run_simulation(params)
-            matrices = run_data["matrices"]
-            pop_count = size(matrices, 2)
-            limit = min(config.sample_size, pop_count)
-            slice = [Matrix(matrices[end, idx]) for idx in 1:limit]
-            return slice, run_data["phenotypic_optima"]
+            local_params = deepcopy(params)
+            local_params.noise_dist = noise_dist
+            simulation_data = run_simulation(local_params)
+            final_matrices = simulation_data.matrices_history[end, :]
+            return sample_matrices(final_matrices, sample_size), simulation_data.optimal_phenotype
         end
         return generator
     end
@@ -416,10 +421,28 @@ export save_experiment_results, load_experiment_results
         Dict(k => (mean(v), std(v) / sqrt(length(v))) for (k, v) in data)
     end
 
+    """
+        aggregate_motif_statistics(generator::Function, config::Experiment2Config; desc::String
+        ) -> MotifStats
+
+    Repeatedly draw a sample of matrices from `generator` and average FFL-type and
+    feedback-loop-type proportions across `config.trials` samples.
+
+    # Arguments
+    - `generator::Function`: Zero-argument function returning `(matrices, optimal_phenotype)`,
+        e.g. from `random_matrix_generator` or `evolved_matrix_generator`.
+    - `config::Experiment2Config`: Experiment configuration (`trials`, `max_loop_size`).
+
+    # Keywords
+    - `desc::String`: Progress bar description.
+
+    # Returns
+    - `MotifStats` with per-trial averages of FFL-type and feedback-loop-type proportions.
+    """
     function aggregate_motif_statistics(generator::Function, config::Experiment2Config; desc::String)
         averages_ffl = Dict{String, Vector{Float64}}()
-        averages_reinf = Dict(n => zeros(config.trials) for n in 1:config.max_loop_size)
-        averages_balanc = Dict(n => zeros(config.trials) for n in 1:config.max_loop_size)
+        averages_feedback_reinforcing = Dict(n => zeros(config.trials) for n in 1:config.max_loop_size)
+        averages_feedback_balancing = Dict(n => zeros(config.trials) for n in 1:config.max_loop_size)
 
         progress = Progress(config.trials; desc=desc)
         for trial in 1:config.trials
@@ -432,84 +455,52 @@ export save_experiment_results, load_experiment_results
 
             fbck_counts = compute_fbck_type_counts(matrices; max_size=config.max_loop_size)
             for size in 1:config.max_loop_size
-                averages_reinf[size][trial] = mean(view(fbck_counts[size], :, 1))
-                averages_balanc[size][trial] = mean(view(fbck_counts[size], :, 2))
+                averages_feedback_reinforcing[size][trial] = mean(view(fbck_counts[size], :, 1))
+                averages_feedback_balancing[size][trial] = mean(view(fbck_counts[size], :, 2))
             end
             next!(progress)
         end
 
-        return MotifStats(averages_ffl, averages_reinf, averages_balanc)
+        return MotifStats(averages_ffl, averages_feedback_reinforcing, averages_feedback_balancing)
     end
 
-    function run_experiment2(config::Experiment2Config, base_params::Dict, noise_scenarios::Vector{NoiseScenario})
-        random_gen = random_matrix_generator(base_params, config)
-        noiseless_gen = evolved_matrix_generator(base_params, Bernoulli(1.0), config)
-        noisy_gen = evolved_matrix_generator(base_params, noise_scenarios[end].distribution, config) #TODO - require a specific noise value
+    """
+        run_experiment_2(config::Experiment2Config, target_scenario::NoiseScenario) -> Experiment2Result
+
+    Run the second experiment of the model. It compares feed-forward-loop and feedback-loop
+    motif statistics between random matrices, matrices evolved without noise, and matrices
+    evolved under `target_scenario`.
+
+    # Arguments
+    - `config::Experiment2Config`: Experiment configuration.
+    - `target_scenario::NoiseScenario`: Noise scenario used for the "noisy" evolved
+        population (see `build_noise_scenarios`).
+
+    # Returns
+    - `Experiment2Result` with motif statistics for the random, noiseless, and noisy
+        populations.
+
+    ### PROGRESS MARK - AUG 27, 2026
+    The experiment 2 needs revision in how are frequencies computed. I need theoretical
+    background. 
+    """
+    function run_experiment_2(config::Experiment2Config)
+        @unpack simulation_parameters, trials, max_loop_size, sample_size, high_noise_dist = config
+
+        random_gen = random_matrix_generator(simulation_parameters, sample_size)
+        noiseless_gen = evolved_matrix_generator(simulation_parameters, Bernoulli(1.0), sample_size)
+        noisy_gen = evolved_matrix_generator(simulation_parameters, high_noise_dist, sample_size)
 
         random_stats = aggregate_motif_statistics(random_gen, config; desc="Random matrices")
         noiseless_stats = aggregate_motif_statistics(noiseless_gen, config; desc="Noiseless evolution")
         noisy_stats = aggregate_motif_statistics(noisy_gen, config; desc="High-noise evolution")
 
-        return Experiment2Result(random_stats, noiseless_stats, noisy_stats, config)
+        return Experiment2Result(random_stats, noiseless_stats, noisy_stats)
     end
 
     # ------------------------------------------------------------------
-    # Serialization helpers (JSON)
+    # PyCall interop helpers
     # ------------------------------------------------------------------
-
-    # TODO - Can I avoid the JSON altogheter with JDL2?
-
-    const GAMMA_ALPHA_KEYS = ("alpha", "shape", "k", "α", "Чс")
-    const GAMMA_THETA_KEYS = ("theta", "scale", "θ", "Чч")
-
-    function first_key_value(obj, keys)
-        for key in keys
-            if haskey(obj, key)
-                return obj[key]
-            end
-        end
-        return nothing
-    end
-
-    StructTypes.StructType(::Type{Experiment1Result}) = StructTypes.Struct()
-    StructTypes.StructType(::Type{Experiment2Result}) = StructTypes.Struct()
-    StructTypes.StructType(::Type{Distribution}) = StructTypes.CustomStruct()
-
-    function StructTypes.lower(dist::Distribution)
-        if dist isa Gamma
-            shape, scale = params(dist)
-            return (; type="Gamma", shape=Float64(shape), scale=Float64(scale))
-        elseif dist isa Bernoulli
-            return (; type="Bernoulli", p=Float64(dist.p))
-        else
-            error("Unsupported distribution type for serialization: $(typeof(dist))")
-        end
-    end
-
-    function StructTypes.construct(::Type{Distribution}, obj)
-        if haskey(obj, "type")
-            dtype = String(obj["type"])
-            if dtype == "Bernoulli"
-                return Bernoulli(Float64(obj["p"]))
-            elseif dtype == "Gamma"
-                return Gamma(Float64(obj["shape"]), Float64(obj["scale"]))
-            else
-                error("Unsupported distribution type in JSON: $(dtype)")
-            end
-        end
-
-        # Legacy payloads without a type field.
-        if haskey(obj, "p")
-            return Bernoulli(Float64(obj["p"]))
-        end
-
-        alpha = first_key_value(obj, GAMMA_ALPHA_KEYS)
-        theta = first_key_value(obj, GAMMA_THETA_KEYS)
-        if alpha === nothing || theta === nothing
-            error("Unsupported distribution payload keys: $(collect(keys(obj)))")
-        end
-        return Gamma(Float64(alpha), Float64(theta))
-    end
 
     python_list(obj) = PyBuiltins["list"](obj)
 
@@ -543,19 +534,4 @@ export save_experiment_results, load_experiment_results
         end
         return result
     end
-
-    # # ------------------------------------------------------------------
-    # # Save/load helpers
-    # # ------------------------------------------------------------------
-
-    # function save_experiment_results(path::AbstractString, result)
-    #     # TODO - Remove. They will be handled via JLD2
-    #     JSON3.write(path, result)
-    #     return nothing
-    # end
-
-    # function load_experiment_results(path::AbstractString, ::Type{T}) where {T}
-    #     return JSON3.read(read(path, String), T)
-    # end
-
 end # module

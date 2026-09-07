@@ -5,15 +5,16 @@ Provides tools and structures to run an evolutionary algorithm of gene-regulator
 
 # Exported structures
 - `SimulationParameters`: Holds the parameters of the simulation. See # Fields
-- `SimulationData`: The results of a simulation. 
+- `SimulationData`: The results of a simulation.
 
 # Exported functions
 - `run_simulation`: Executes a single simulation run with a given set of parameters
 
 # Notes
-- The module is based on Wagner (1996). Modifications and extensions include more types of 
-    initial populations, noisy gene-gene interactions, and different types of selection.
-- The module does not use parallel processing because threads are dedicated to running 
+- The module is based on Wagner (1996). Modifications and extensions include more types of
+    initial populations, noisy gene-gene interactions, different types of selection,
+    configurable activation functions/regimes, and synchronous or asynchronous development.
+- The module does not use parallel processing because threads are dedicated to running
     multiple experiments simultaneously.
 """
 module BooleanNetwork
@@ -32,6 +33,7 @@ export run_simulation
 const valid_initial_pop_types = [:random, :stable, :unstable, :optimal_clones,
     :nonoptimal_clones, :ensemble_sample]
 const valid_selection_types = [:wagner, :roulette]
+const valid_development_types = [:synchronous, :asynchronous]
 
     """
     --------------------
@@ -46,7 +48,15 @@ const valid_selection_types = [:wagner, :roulette]
     Holds configuration settings and initial conditions for a simulation run.
 
     # Fields
-    - `generations::Int`: Total number of evolutionary generations to simulate. 
+    - `activation_function::Function`: A function `f: ℝ → A` mapping the weighted sum of a
+        gene's regulatory inputs to its next expression value (`A` is the co-domain implied
+        by `activation_regime`, e.g. `{-1,1}` for `sign` or `{0,1}` for a step function).
+    - `activation_regime::Tuple{Float64,Float64}`: The two values genes can take (off, on),
+        matching the co-domain of `activation_function`. E.g. `(0.0,1.0)` or `(-1.0,1.0)`.
+    - `development_type::Symbol`: How gene states are updated during development; one of
+        `valid_development_types` (`:synchronous` updates every gene at once each step,
+        `:asynchronous` updates genes one at a time, in order, within each sweep).
+    - `generations::Int`: Total number of evolutionary generations to simulate.
     - `initial_density::Float64`: Initial connectivity density of networks in the population.
     - `initial_pop_type::Symbol`: Initial population stability.
     - `max_steps::Int`: Maximum steps in phenotype expression.
@@ -61,9 +71,11 @@ const valid_selection_types = [:wagner, :roulette]
 
     # TODO
     - add regulatory genes, which are not directly under selective pressure
-    - add development mode (a string containing synchronous or asynchronous)
     """
     @kwdef mutable struct SimulationParameters{W<:Distribution}
+        activation_function::Function = sign
+        activation_regime::Tuple{Float64, Float64} = (-1.0,1.0)
+        development_type::Symbol = :synchronous
         generations::Int = 500
         initial_density::Float64 = 1.0
         initial_pop_type::Symbol = :stable
@@ -152,46 +164,57 @@ const valid_selection_types = [:wagner, :roulette]
     end
 
     """
-        develop(W::Matrix{<:Real}, initial_state::Vector{<:Real}, max_steps::Int;
+        develop(W::Matrix{<:Real}, initial_state::Vector{<:Real}, max_steps::Int, 
+            activation_function::Function, development_type::Symbol;
             buffer1::Vector{Float64}=Vector{Float64}(undef, size(W,1)),
             buffer2::Vector{Float64}=Vector{Float64}(undef, size(W,1))
         ) -> Tuple{Union{Vector{Float64},Nothing}, Union{Int,Nothing}}
     
-    Develop a network phenotype by iterating `state -> sign.(W * state)` from
-    `initial_state`. Halts as soon as a fixed point is reached, a previously visited state 
-    recurs (indicating a limit cycle), or `max_steps` iterations have elapsed.
-    
+    Develop a network phenotype by repeatedly applying `activation_function` to each gene's
+    weighted regulatory input from `initial_state`, either all at once (`:synchronous`) or
+    one gene at a time in index order (`:asynchronous`). Halts as soon as a fixed point is
+    reached, a previously visited state recurs (indicating a limit cycle), or `max_steps`
+    iterations have elapsed.
+
     # Arguments
     - `W`: gene interaction matrix of the network; assumed square.
     - `initial_state`: initial gene expression state, of length `size(W, 1)`.
     - `max_steps`: maximum number of iterations attempted before the state is
         declared unstable.
-    
+    - `activation_function`: function `f: ℝ → A` mapping a gene's weighted regulatory
+        input to its next expression value.
+    - `development_type`: one of `valid_development_types`.
+        - `:synchronous`: every gene is updated at once from the previous step's state,
+            i.e. `state -> activation_function.(W * state)`.
+        - `:asynchronous`: genes are updated one at a time, in index order, each seeing the
+            already-updated values of earlier genes within the same sweep (Gauss-Seidel-style).
+
     # Keywords
     - `buffer1`, `buffer2`: pre-allocated, length-`size(W,1)` buffers used to hold
         intermediate states. Repeated calls avoid reallocating the state vector each time.
-    
+
     # Returns
-    - `(final_state, steps_taken)` if a fixed point was reached. 
+    - `(final_state, steps_taken)` if a fixed point was reached.
     - `(nothing, nothing)` if a cycle was detected or `max_steps` was exhausted
         without stabilizing.
 
     # Throws
     - `DimensionMismatch` if W is not square, has a different number of columns than
         the size of initial_state, or the buffers do not have the same size as initial_state.
-    
+    - `ArgumentError` if `development_type` is not in `valid_development_types`.
+
     # TODO
-    - Add asynchronous development possibility
-    - Add the possibility of other activation functions
     - Optimize cycle finding algorithm. It currently holds the entire history
     """
     function develop(
         W::Matrix{<:Real},
         initial_state::Vector{<:Real},
-        max_steps::Int;
+        max_steps::Int,
+        activation_function::Function,
+        development_type::Symbol;
         buffer1::Vector{Float64}=Vector{Float64}(undef, size(W, 1)),
         buffer2::Vector{Float64}=Vector{Float64}(undef, size(W, 1))
-    )::Tuple{Union{Vector{Float64},Nothing},Union{Int,Nothing}} 
+    )::Tuple{Union{Vector{Float64},Nothing},Union{Int,Nothing}}
         n = size(W, 1)
         size(W, 2) == n ||
             throw(DimensionMismatch("W must be square"))
@@ -199,29 +222,57 @@ const valid_selection_types = [:wagner, :roulette]
             throw(DimensionMismatch("initial_state must have length size(W, 1)"))
         (length(buffer1) == n && length(buffer2) == n) ||
             throw(DimensionMismatch("buffer1 and buffer2 must have length size(W, 1)"))
+        development_type in valid_development_types ||
+            throw(ArgumentError("$(development_type) is not a valid development type. " *
+                "Try with $valid_development_types"))
 
         buffer1 .= initial_state
+        buffer2 .= initial_state
 
         visited_states = Dict{Vector{Float64},Int}()
         sizehint!(visited_states, max_steps + 1)
-        visited_states[copy(buffer1)] = 0 
+        visited_states[copy(buffer1)] = 0
 
-        for step in 0:max_steps 
-            mul!(buffer2, W, buffer1)  # in-place matrix multiplication
-            buffer2 .= sign.(buffer2)  # in-place activation
+        if development_type == :synchronous
+            for step in 0:max_steps  # If the first step shows it's already stable, we did 0 steps
+                mul!(buffer2, W, buffer1)
+                buffer2 .= activation_function.(buffer2)
 
-            if buffer2 == buffer1
-                return (copy(buffer2), step)  # fixed point reached in `step` iterations
+                if buffer2 == buffer1
+                    return (copy(buffer2), step)  # fixed point reached in `step` iterations
+                end
+
+                if haskey(visited_states, buffer2)
+                    return (nothing, nothing)  # limit cycle detected
+                end
+
+                visited_states[copy(buffer2)] = step  # copy: buffer2 will be overwritten later
+
+                buffer1, buffer2 = buffer2, buffer1  # swap roles for the next iteration
             end
-            if haskey(visited_states, buffer2)
-                return (nothing, nothing)  # limit cycle detected
-            end
-            visited_states[copy(buffer2)] = step  # copy: buffer2 will be overwritten later
 
-            buffer1, buffer2 = buffer2, buffer1  # swap roles for the next iteration
+            return (nothing, nothing)  # did not stabilize within max_steps
+        else  # :asynchronous
+            for step in 0:max_steps
+                buffer2 .= buffer1  # snapshot of the state before this sweep
+
+                for row in 1:n
+                    buffer1[row] = activation_function(dot(W[row, :], buffer1))
+                end
+
+                if buffer2 == buffer1  # no value changed in this sweep
+                    return (copy(buffer2), step)
+                end
+
+                if haskey(visited_states, buffer1)
+                    return (nothing, nothing)  # limit cycle detected
+                end
+
+                visited_states[copy(buffer1)] = step
+            end
+
+            return (nothing, nothing)  # did not stabilize within max_steps
         end
-
-        return (nothing, nothing)  # did not stabilize within max_steps
     end
     
     """
@@ -280,14 +331,14 @@ const valid_selection_types = [:wagner, :roulette]
     end
 
     """
-        initialize_population(params::Dict
+        initialize_population(params::SimulationParameters
         ) -> Tuple{Vector{Float64}, Vector{Float64}, Vector{Matrix{Float64}}}
 
     Initialize a population of gene regulatory networks according to specified mode.
     Uses pre-allocated buffers and optimized matrix generation.
 
     # Arguments
-    - `params`: Dictionary of simulation parameters
+    - `params`: Object containing the simulation parameters
 
     # Returns
     - Tuple of:
@@ -297,30 +348,33 @@ const valid_selection_types = [:wagner, :roulette]
 
     # Throws
     - `ArgumentError`: If the type of initial population is not valid
-
-    #TODO
-    - Add asynchornous development mode
-    - Add possibility to switch domains [1.0, -1.0] <-> [1.0, 0.0]
+    - `DomainError`: If the initial population type is unstable and the development type is
+        asynchronous. It will stall the function otherwise because asynchronous will always
+        find a stable state.
     """
     function initialize_population(
         params::SimulationParameters
     )::Tuple{Vector{Float64},Vector{Float64},Vector{Matrix{Float64}}}
 
-        @unpack initial_pop_type, number_genes, max_steps, weights_dist,
-        initial_density, pop_size = params
+        @unpack initial_pop_type, number_genes, max_steps, weights_dist, initial_density, 
+        pop_size, activation_function, activation_regime, development_type = params
 
         initial_pop_type in valid_initial_pop_types ||
             throw(ArgumentError("$(initial_pop_type) is not a valid type of initial" *
                                 "population. Try with $valid_initial_pop_types"))
+        
+        (initial_pop_type != :unstable || development_type != :asynchronous) ||
+            throw(DomainError("initial_pop_type=$initial_pop_type and " *
+                "development_type$development_type will stall initialize_population")) 
         # ---Constants---
-        initial_state = rand([1.0, -1.0], number_genes)
-        optimal_phenotype = rand([1.0, -1.0], number_genes)
-        # TODO - Add possibility of switching [1.0,-1.0] domain to [1.0,0.0]
+        initial_state = rand(activation_regime, number_genes)
+        optimal_phenotype = rand(activation_regime, number_genes)
         buffer1 = Vector{Float64}(undef, number_genes)
         buffer2 = Vector{Float64}(undef, number_genes)
 
         # ---Useful methods---
-        is_stable(matrix) = !isnothing(develop(matrix, initial_state, max_steps;
+        is_stable(matrix) = !isnothing(develop(matrix, initial_state, max_steps, 
+            activation_function, development_type;
             buffer1=buffer1, buffer2=buffer2)[1])
         stable_matrix() = begin
             while true
@@ -361,7 +415,8 @@ const valid_selection_types = [:wagner, :roulette]
         elseif initial_pop_type == :optimal_clones
             # Find a stable matrix and clone it with its expressed phenotype set as optimal
             candidate = stable_matrix()
-            expressed_phenotype, _ = develop(candidate, initial_state, max_steps;
+            expressed_phenotype, _ = develop(candidate, initial_state, max_steps, 
+                activation_function, development_type;
                 buffer1=buffer1, buffer2=buffer2)
             matrices = [copy(candidate) for _ in 1:pop_size]
             return (initial_state, expressed_phenotype, matrices)
@@ -381,7 +436,8 @@ const valid_selection_types = [:wagner, :roulette]
 
             while population_count < pop_size
                 candidate = generate_random_matrix(number_genes, weights_dist, initial_density)
-                phenotype, steps = develop(candidate, initial_state, max_steps;
+                phenotype, steps = develop(candidate, initial_state, max_steps, 
+                    activation_function, development_type;
                     buffer1=buffer1, buffer2=buffer2)
 
                 if !isnothing(steps) && phenotype == optimal_phenotype
@@ -396,8 +452,8 @@ const valid_selection_types = [:wagner, :roulette]
                 if attempts > attempt_limit  # Reset if we've tried too many times
                     population_count = 0
                     attempts = 0
-                    initial_state = rand([1.0, -1.0], number_genes)
-                    optimal_phenotype = rand([1.0, -1.0], number_genes)
+                    initial_state = rand(activation_regime, number_genes)
+                    optimal_phenotype = rand(activation_regime, number_genes)
                 end
             end
 
@@ -550,12 +606,8 @@ const valid_selection_types = [:wagner, :roulette]
     - Offspring are added into the new generation with a probability proportional to the
         previous generation's fitness in the Roulette type of selection.
     - Noise is applied after mutation but before development.
-    - Stability is determined by the `develop` function; a stable phenotype is any 
+    - Stability is determined by the `develop` function; a stable phenotype is any
         non-`nothing` return value.
-
-    # TODO
-    - Integrate asynchronous development possibility
-    - Integrate possibility of other activation functions
     """
 
     function create_offspring(pop::ArtificialPop, params::SimulationParameters;
@@ -566,7 +618,8 @@ const valid_selection_types = [:wagner, :roulette]
             throw(ArgumentError("$(params.selection_type) is not a valid selection type. " *
                 "Try with something in $valid_selection_types"))
         @unpack generations, max_steps, mutation_prob, noise_dist, number_genes, pop_size,
-            selection_pressure, selection_type, unstable_fitness, weights_dist = params
+            selection_pressure, selection_type, unstable_fitness, weights_dist,
+            activation_function, development_type = params
         @unpack matrices, initial_state, optimal_phenotype = pop  # avoid overwriting
         
         completion_gen = BitVector(undef, pop_size)
@@ -588,7 +641,8 @@ const valid_selection_types = [:wagner, :roulette]
                     copyto!(noisy_W, W_candidate)
                     apply_noise!(noisy_W, noise_dist)  # Noisy gene interactions
 
-                    expressed_phenotype, path_length = develop(noisy_W, initial_state, max_steps;
+                    expressed_phenotype, path_length = develop(noisy_W, initial_state, 
+                        max_steps, activation_function, development_type;
                         buffer1=buffer1, buffer2=buffer2) 
                     fit = indiv_fitness(expressed_phenotype, optimal_phenotype, 
                         selection_pressure, unstable_fitness) # Compute fitness
@@ -609,8 +663,9 @@ const valid_selection_types = [:wagner, :roulette]
             for i in 1:pop_size
                 copyto!(noisy_W, matrices[i])
                 apply_noise!(noisy_W, noise_dist)  # Noisy gene interactions
-                expressed_phenotype, path_length = develop(noisy_W, initial_state, max_steps;
-                buffer1=buffer1, buffer2=buffer2)
+                expressed_phenotype, path_length = develop(noisy_W, initial_state, 
+                    max_steps, activation_function, development_type;
+                    buffer1=buffer1, buffer2=buffer2)
                 fit = indiv_fitness(expressed_phenotype, optimal_phenotype,
                     selection_pressure, unstable_fitness) # Compute fitness
                 
@@ -656,19 +711,15 @@ const valid_selection_types = [:wagner, :roulette]
     - `"phenotypic_optima"::Vector{Int}`: Target phenotype vector
 
     # Notes
-    - The type of selection determines which is the fitness of the first generation. 
+    - The type of selection determines which is the fitness of the first generation.
         Wagner-like selection records the fitness of the offspring, and Roulette selection
-        records the fitness of the parents. 
-    
-    # TODO
-    - Make sure it works with asynchronous development
-    - Integrate possibility of other activation functions
+        records the fitness of the parents.
     """
 
     function run_simulation(params::SimulationParameters)::SimulationData
         @unpack generations, initial_density, initial_pop_type, max_steps, mutation_prob, 
             noise_dist, number_genes, pop_size, selection_pressure, selection_type, 
-            unstable_fitness, weights_dist = params
+            unstable_fitness, weights_dist, activation_function, development_type = params
 
         simulation_data = SimulationData(
             completion_history=BitMatrix(undef, (generations, pop_size)),
@@ -708,7 +759,8 @@ const valid_selection_types = [:wagner, :roulette]
                 # completion for the initial population
                 copyto!(noisy_W, matrix)
                 apply_noise!(noisy_W, noise_dist)
-                phenotype, path_length = develop(noisy_W, population.initial_state, max_steps;
+                phenotype, path_length = develop(noisy_W, population.initial_state, 
+                    max_steps, activation_function, development_type;
                     buffer1=buffer1, buffer2=buffer2)
                 fit = indiv_fitness(phenotype, population.optimal_phenotype, 
                     selection_pressure, unstable_fitness)

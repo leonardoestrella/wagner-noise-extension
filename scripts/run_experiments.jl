@@ -80,7 +80,7 @@ export run_experiment_1, run_experiment_2, build_noise_scenarios
         sample_points::Vector{Int} = [1,500]
         sample_sizes:: Int = 30
         standard_noise::Distribution = Gamma(1.0,1.0)
-        thetas::Vector{Float64} = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+        thetas::Vector{Float64} = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0] 
         trials::Int = 30
     end
 

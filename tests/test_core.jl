@@ -46,35 +46,88 @@ end
     @test_throws DimensionMismatch BooleanNetwork.hamming_distance([1.0, -1.0], [1.0, -1.0, 1.0])
 end
 
+@testset "SimulationParameters defaults" begin
+    params = BooleanNetwork.SimulationParameters()
+    @test params.activation_function === sign
+    @test params.activation_regime == (-1.0, 1.0)
+    @test params.development_type == :synchronous
+    @test params.development_type in BooleanNetwork.valid_development_types
+end
+
 @testset "develop" begin
     # Fixed point: identity matrix keeps the state unchanged
     N = 4
     W_identity = Matrix{Float64}(I, N, N)
     state = [1.0, -1.0, 1.0, -1.0]
-    final_state, steps = BooleanNetwork.develop(W_identity, state, 10)
+    final_state, steps = BooleanNetwork.develop(W_identity, state, 10, sign, :synchronous)
     @test final_state == state
     @test steps == 0
 
-    # Limit cycle / non-convergence: pure sign-flip oscillates forever
+    # Limit cycle / non-convergence: pure sign-flip oscillates forever (synchronous)
     W_flip = [0.0 -1.0; -1.0 0.0]
     flip_state = [1.0, 1.0]
-    final_flip, steps_flip = BooleanNetwork.develop(W_flip, flip_state, 10)
+    final_flip, steps_flip = BooleanNetwork.develop(W_flip, flip_state, 10, sign, :synchronous)
     @test final_flip === nothing
     @test steps_flip === nothing
 
     # max_steps exhausted without stabilizing (same oscillation, tiny budget)
-    final_short, steps_short = BooleanNetwork.develop(W_flip, flip_state, 1)
+    final_short, steps_short = BooleanNetwork.develop(W_flip, flip_state, 1, sign, :synchronous)
     @test final_short === nothing
     @test steps_short === nothing
 
     # Dimension errors
     non_square = ones(2, 3)
-    @test_throws DimensionMismatch BooleanNetwork.develop(non_square, [1.0, -1.0], 10)
-    @test_throws DimensionMismatch BooleanNetwork.develop(W_identity, [1.0, -1.0], 10)
+    @test_throws DimensionMismatch BooleanNetwork.develop(non_square, [1.0, -1.0], 10, sign, :synchronous)
+    @test_throws DimensionMismatch BooleanNetwork.develop(W_identity, [1.0, -1.0], 10, sign, :synchronous)
     @test_throws DimensionMismatch BooleanNetwork.develop(
-        W_identity, state, 10; buffer1=Vector{Float64}(undef, 2))
+        W_identity, state, 10, sign, :synchronous; buffer1=Vector{Float64}(undef, 2))
     @test_throws DimensionMismatch BooleanNetwork.develop(
-        W_identity, state, 10; buffer2=Vector{Float64}(undef, 2))
+        W_identity, state, 10, sign, :synchronous; buffer2=Vector{Float64}(undef, 2))
+
+    # Invalid development_type
+    @test_throws ArgumentError BooleanNetwork.develop(W_identity, state, 10, sign, :not_a_type)
+end
+
+@testset "develop - asynchronous vs synchronous" begin
+    # Same oscillator matrix that never stabilizes synchronously (tested above): the
+    # Gauss-Seidel-style asynchronous sweep breaks the symmetry and converges instead.
+    W_flip = [0.0 -1.0; -1.0 0.0]
+    flip_state = [1.0, 1.0]
+
+    final_sync, steps_sync = BooleanNetwork.develop(W_flip, flip_state, 10, sign, :synchronous)
+    @test final_sync === nothing
+    @test steps_sync === nothing
+
+    final_async, steps_async = BooleanNetwork.develop(W_flip, flip_state, 10, sign, :asynchronous)
+    @test final_async == [-1.0, 1.0]
+    @test steps_async == 1
+
+    # Fixed point under asynchronous development: identity matrix is trivially stable
+    # regardless of update order
+    N = 4
+    W_identity = Matrix{Float64}(I, N, N)
+    state = [1.0, -1.0, 1.0, -1.0]
+    final_state, steps = BooleanNetwork.develop(W_identity, state, 10, sign, :asynchronous)
+    @test final_state == state
+    @test steps == 0
+end
+
+@testset "develop - custom activation function and regime" begin
+    # A step function over the {0,1} regime instead of sign over {-1,1}
+    step_activation(x) = x < 0.5 ? 0.0 : 1.0
+
+    # Fixed point: identity matrix keeps the {0,1} state unchanged
+    W_identity = Matrix{Float64}(I, 2, 2)
+    state = [1.0, 0.0]
+    final_state, steps = BooleanNetwork.develop(W_identity, state, 10, step_activation, :synchronous)
+    @test final_state == state
+    @test steps == 0
+
+    # Limit cycle: swapping the two genes each step oscillates forever under this activation
+    W_swap = [0.0 1.0; 1.0 0.0]
+    final_cycle, steps_cycle = BooleanNetwork.develop(W_swap, state, 10, step_activation, :synchronous)
+    @test final_cycle === nothing
+    @test steps_cycle === nothing
 end
 
 @testset "indiv_fitness" begin
@@ -90,37 +143,6 @@ end
     expected = exp(-selection_pressure * BooleanNetwork.hamming_distance(half_off, optimal))
     @test BooleanNetwork.indiv_fitness(half_off, optimal, selection_pressure, unstable_fitness) ≈ expected
 end
-
-### THIS HAS NOT BEEN IMPLEMENTED - AUG 13, 2026
-# @testset "develop_asynchronous" begin  
-#     activation = sign
-
-#     # 1) Basic behavior: asynchronous updates should reach the expected fixed point
-#     W = [0.0 2.0;
-#          2.0 0.0]
-#     initial_state = [1, -1]
-#     final_state, sweeps = BooleanNetwork.develop_asynchronous(W, initial_state, 10, activation)
-#     @test final_state !== nothing
-#     @test sweeps == 2
-#     @test final_state == [-1.0, -1.0]
-
-#     # 2) Termination case: identity matrix with all-ones state should stabilize immediately
-#     N = 6
-#     W_identity = Matrix{Float64}(I, N, N)
-#     ones_state = ones(Int, N)
-#     final_identity, sweeps_identity = BooleanNetwork.develop_asynchronous(
-#         W_identity, ones_state, 100, activation
-#     )
-#     @test final_identity !== nothing
-#     @test sweeps_identity == 1
-#     @test final_identity == ones(Float64, N)
-
-#     # 3) Input immutability: function must not mutate initial_state
-#     immutable_check_state = [1, -1, 1, -1]
-#     original_copy = copy(immutable_check_state)
-#     _ = BooleanNetwork.develop_asynchronous(Matrix{Float64}(I, 4, 4), immutable_check_state, 5, activation)
-#     @test immutable_check_state == original_copy
-# end
 
 @testset "mutation!" begin
     N = 5
@@ -187,20 +209,20 @@ end
         @test all(W -> size(W) == (N, N), matrices)
 
         if pop_type == :stable
-            @test all(W -> !isnothing(BooleanNetwork.develop(W, initial_state, max_steps)[1]),
+            @test all(W -> !isnothing(BooleanNetwork.develop(W, initial_state, max_steps, sign, :synchronous)[1]),
                 matrices)
         elseif pop_type == :unstable
-            @test all(W -> isnothing(BooleanNetwork.develop(W, initial_state, max_steps)[1]),
+            @test all(W -> isnothing(BooleanNetwork.develop(W, initial_state, max_steps, sign, :synchronous)[1]),
                 matrices)
         elseif pop_type == :optimal_clones
             @test all(W -> W == matrices[1], matrices)  # All clones identical
-            expressed, _ = BooleanNetwork.develop(matrices[1], initial_state, max_steps)
+            expressed, _ = BooleanNetwork.develop(matrices[1], initial_state, max_steps, sign, :synchronous)
             @test expressed == optimal_phenotype
         elseif pop_type == :nonoptimal_clones
             @test all(W -> W == matrices[1], matrices)  # All clones identical
         elseif pop_type == :ensemble_sample
             @test all(matrices) do W
-                phenotype, steps = BooleanNetwork.develop(W, initial_state, max_steps)
+                phenotype, steps = BooleanNetwork.develop(W, initial_state, max_steps, sign, :synchronous)
                 !isnothing(steps) && phenotype == optimal_phenotype
             end
         end
@@ -208,6 +230,31 @@ end
 
     bad_params = BooleanNetwork.SimulationParameters(initial_pop_type=:not_a_type)
     @test_throws ArgumentError BooleanNetwork.initialize_population(bad_params)
+end
+
+@testset "initialize_population - custom activation function and regime" begin
+    # Same {0,1} step activation used in the "develop" tests, wired through
+    # SimulationParameters end-to-end instead of called directly.
+    step_activation(x) = x < 0.5 ? 0.0 : 1.0
+    N = 5
+
+    for pop_type in (:stable, :unstable)
+        params = BooleanNetwork.SimulationParameters(number_genes=N, pop_size=10,
+            activation_function=step_activation, activation_regime=(0.0, 1.0),
+            initial_pop_type=pop_type)
+        initial_state, optimal_phenotype, matrices = BooleanNetwork.initialize_population(params)
+
+        @test all(x -> x in (0.0, 1.0), initial_state)
+        @test all(x -> x in (0.0, 1.0), optimal_phenotype)
+
+        is_stable(W) = !isnothing(BooleanNetwork.develop(
+            W, initial_state, params.max_steps, step_activation, :synchronous)[1])
+        if pop_type == :stable
+            @test all(is_stable, matrices)
+        else
+            @test all(!is_stable, matrices)
+        end
+    end
 end
 
 @testset "create_offspring" begin
@@ -277,6 +324,15 @@ end
             number_genes=5, selection_type=selection_type)
         result_sel = BooleanNetwork.run_simulation(params_sel)
         @test size(result_sel.matrices_history) == (params_sel.generations, params_sel.pop_size)
+    end
+
+    # All development types (smoke test: the full evolutionary loop must run without
+    # crashing under asynchronous development, not just the standalone `develop` function)
+    for development_type in BooleanNetwork.valid_development_types
+        params_dev = BooleanNetwork.SimulationParameters(generations=5, pop_size=10,
+            number_genes=5, development_type=development_type)
+        result_dev = BooleanNetwork.run_simulation(params_dev)
+        @test size(result_dev.matrices_history) == (params_dev.generations, params_dev.pop_size)
     end
 end
 

@@ -128,27 +128,35 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
     end
 
     """
-        generate_expression_distribution(matrix::Matrix{Float64}, 
+        generate_expression_distribution(matrix::Matrix{Float64},
                             initial_state::Vector{Float64},
                             number_noise_samples::Int,
                             noise_dist::Distribution,
                             max_steps::Int,  # Default: simulation parameter
+                            activation_function::Function,  # Default: simulation parameter
+                            development_type::Symbol,  # Default: simulation parameter
         )::Tuple{Vector{Float64}, Float64}
 
     Generates a sample from the expression distribution for a given matrix using a specified
-    noise distribution
+    noise distribution.
+
+    # Arguments
+    - `matrix`: Weight matrix to develop under noise.
+    - `initial_state`: Initial gene expression state.
+    - `number_noise_samples`: Number of noisy developments to sample.
+    - `noise_dist`: Distribution used to perturb the matrix before each development.
+    - `max_steps`: Max steps in development; forwarded to `develop`.
+    - `activation_function`: Maps a gene's weighted regulatory input to its next expression
+        value; forwarded to `develop`.
+    - `development_type`: `:synchronous` or `:asynchronous`; forwarded to `develop`.
 
     # Returns
-    A tuple containing: 
+    A tuple containing:
     - avg_stable_expression: The sampled average expression vector.
     - unstable_proportion: The fraction of times the expressed phenotype was unstable.
 
     # Notes
     - stable_count helps keep track of the index at which the last stable state was stored
-
-    # TODO
-    - Ensure compatibility with asynchornous development. 
-    - Ensure compatibility with different activation functions. 
     """
 
     function generate_expression_distribution(matrix::Matrix{Float64}, 
@@ -156,6 +164,8 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
                             number_noise_samples::Int,
                             noise_dist::Distribution,
                             max_steps::Int=SimulationParameters().max_steps,
+                            activation_function::Function=SimulationParameters().activation_function,
+                            development_type::Symbol=SimulationParameters().development_type
     )::Tuple{Vector{Float64}, Float64}
         number_genes = size(matrix, 1)
         unstable_count = 0
@@ -168,7 +178,8 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
         for idx in 1:number_noise_samples
             copyto!(buffer_matrix, matrix)
             apply_noise!(buffer_matrix, noise_dist)
-            final_state, _ = develop(buffer_matrix, initial_state, max_steps;
+            final_state, _ = develop(buffer_matrix, initial_state, max_steps, 
+                activation_function, development_type;
                 buffer1=buffer_vec_1, buffer2=buffer_vec_2)
 
             if !isnothing(final_state)
@@ -202,18 +213,29 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
             weights_dist::Distribution,  # Matrix weights will be resampled from here
                 Default: simulation parameter
             max_steps::Int,  # Max steps in development. Default: simulation parameter
+            activation_function::Function,  # Default: simulation parameter
+            development_type::Symbol,  # Default: simulation parameter
             )::NamedTuple{stable_expression_shift::Float64, stable_expression_var::Float64,
                 unstable_prob_shift::Float64, unstable_prob_var::Float64}
 
-    Estimate the mutational robustness of a regulatory matrix by repeatedly mutating its 
-    non-zero entries, simulating noisy dynamics, and aggregating how much the stable 
+    Estimate the mutational robustness of a regulatory matrix by repeatedly mutating its
+    non-zero entries, simulating noisy dynamics, and aggregating how much the stable
     expression distribution sample summary statistics differ relative to the non-mutated
     baseline.
 
-    Returns a `NamedTuple` with:
-    - `stable_expression_shift`: average absolute difference between the baseline and 
+    # Keywords
+    - `weights_dist`: Distribution used to resample mutated weights. Default: simulation parameter.
+    - `max_steps`: Max steps in development. Default: simulation parameter.
+    - `activation_function`: Maps a gene's weighted regulatory input to its next expression
+        value; forwarded to `develop`. Default: simulation parameter.
+    - `development_type`: `:synchronous` or `:asynchronous`; forwarded to `develop`.
+        Default: simulation parameter.
+
+    # Returns
+    A `NamedTuple` with:
+    - `stable_expression_shift`: average absolute difference between the baseline and
     mutated average stable expression vectors (averaged over mutations).
-    - `stable_expression_var`: total sample variance in the expressed phenotypes average 
+    - `stable_expression_var`: total sample variance in the expressed phenotypes average
         expression from mutated phenotypes
     - `unstable_prob_shift`: average difference in the probability of converging to
       an unstable phenotype after mutation relative to baseline.
@@ -225,11 +247,8 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
         equal to 1.
 
     # Notes
-    - Can broadcast to a grid of matrices by using compute_mut_robustness.(grid_matrices, 
+    - Can broadcast to a grid of matrices by using compute_mut_robustness.(grid_matrices,
     Ref(initial_state), Ref(number_mutation_samples), ...)
-
-    # TODO:
-    - Ensure compatibility with asynchronous development and different activation functions
     """
     function compute_mut_robustness(
         matrix::Matrix{Float64}, 
@@ -240,6 +259,8 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
         mutation_prob::Float64; 
         weights_dist::Distribution=SimulationParameters().weights_dist,
         max_steps::Int=SimulationParameters().max_steps,
+        activation_function::Function=SimulationParameters().activation_function,
+        development_type::Symbol=SimulationParameters().development_type
     )::NamedTuple{(:stable_expression_shift, :stable_expression_var, 
     :unstable_prob_shift, :unstable_prob_var), 
     Tuple{Float64, Float64, Float64, Float64}      
@@ -253,7 +274,8 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
 
         number_genes = size(matrix, 1)
         baseline_mean, baseline_unstable_prob = generate_expression_distribution(matrix,
-            initial_state, number_noise_samples, noise_dist, max_steps)
+            initial_state, number_noise_samples, noise_dist, max_steps, activation_function,
+            development_type)
 
         unstable_probs = Vector{Float64}(undef, number_mutation_samples)
         stable_expressions = Matrix{Float64}(undef, number_mutation_samples, number_genes)
@@ -264,7 +286,8 @@ export summarize_history, summarize_simulation_run, alignment_score, compute_mut
             mutation!(mutated_matrix, mutation_prob, weights_dist)
             
             mutated_mean, mutated_unstable_prob = generate_expression_distribution(
-                mutated_matrix, initial_state, number_noise_samples, noise_dist, max_steps)
+                mutated_matrix, initial_state, number_noise_samples, noise_dist, max_steps,
+                activation_function, development_type)
 
             stable_expressions[mutation_idx,:] .= mutated_mean
             unstable_probs[mutation_idx] = mutated_unstable_prob

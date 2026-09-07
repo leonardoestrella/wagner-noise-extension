@@ -115,7 +115,7 @@ end
     # No noise: development is deterministic, so every sample is stable and identical
     avg_expression, unstable_prop = CustomStats.generate_expression_distribution(
         matrix, initial_state, 5, Bernoulli(1.0), 10)
-    final_state, _ = BooleanNetwork.develop(matrix, initial_state, 10)
+    final_state, _ = BooleanNetwork.develop(matrix, initial_state, 10, sign, :synchronous)
     @test avg_expression ≈ final_state atol=1e-12
     @test unstable_prop == 0.0
 
@@ -149,6 +149,23 @@ end
     @test length(avg_mixed) == N
     @test all(x -> -1.0 <= x <= 1.0, avg_mixed)
     @test 0.0 <= unstable_prop_mixed <= 1.0
+
+    # Custom activation function/regime: {0,1} step activation instead of sign over {-1,1}
+    step_activation(x) = x < 0.5 ? 0.0 : 1.0
+    state_01 = [1.0, 0.0]
+    avg_step, unstable_prop_step = CustomStats.generate_expression_distribution(
+        matrix, state_01, 5, Bernoulli(1.0), 10, step_activation, :synchronous)
+    final_state_01, _ = BooleanNetwork.develop(matrix, state_01, 10, step_activation, :synchronous)
+    @test avg_step ≈ final_state_01 atol=1e-12
+    @test unstable_prop_step == 0.0
+
+    # Asynchronous development: the oscillator matrix that never stabilizes synchronously
+    # (see test_core.jl "develop - asynchronous vs synchronous") converges under
+    # asynchronous updates, so it should register as stable here too.
+    avg_async, unstable_prop_async = CustomStats.generate_expression_distribution(
+        W_flip, [1.0, 1.0], 5, Bernoulli(1.0), 10, sign, :asynchronous)
+    @test avg_async ≈ [-1.0, 1.0] atol=1e-12
+    @test unstable_prop_async == 0.0
 end
 
 @testset "compute_mut_robustness" begin
@@ -250,6 +267,37 @@ end
             weights_dist=weights_dist, max_steps=max_steps)
         @test size(results) == (2, 2)
         @test all(r -> isapprox(r.stable_expression_shift, 0.0; atol=1e-12), results)
+    end
+
+    @testset "custom activation function and regime" begin
+        # {0,1} step activation instead of the default sign over {-1,1}
+        step_activation(x) = x < 0.5 ? 0.0 : 1.0
+        state_01 = [1.0, 0.0]
+        res = CustomStats.compute_mut_robustness(
+            matrix, state_01,
+            n_mutation_samples, n_noise_samples,
+            Bernoulli(1.0), 0.0;  # No noise, no mutations
+            weights_dist=weights_dist, max_steps=max_steps,
+            activation_function=step_activation, development_type=:synchronous
+        )
+        # Deterministic (no noise/mutations): identical to the baseline every time
+        @test isapprox(res.stable_expression_shift, 0.0; atol=1e-12)
+        @test isapprox(res.stable_expression_var, 0.0; atol=1e-12)
+        @test isapprox(res.unstable_prob_shift, 0.0; atol=1e-12)
+        @test isapprox(res.unstable_prob_var, 0.0; atol=1e-12)
+    end
+
+    @testset "asynchronous development" begin
+        Random.seed!(42)
+        res = CustomStats.compute_mut_robustness(
+            matrix, initial_state,
+            n_mutation_samples, n_noise_samples,
+            Gamma(1.0, 1.0), 0.01;  # Same "active noise and mutations" regime as above
+            weights_dist=weights_dist, max_steps=max_steps,
+            development_type=:asynchronous
+        )
+        @test res.stable_expression_var >= 0.0
+        @test res.unstable_prob_var >= 0.0
     end
 end
 

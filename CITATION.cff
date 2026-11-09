@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "wagner-noise-extension"
+abstract: "An extension of Wagner's (1996) evolutionary algorithm for gene regulatory networks that incorporates noisy phenotype expression."
+type: software
+authors:
+  - family-names: "Estrella Dzib"
+    given-names: "Leonardo Ivan"
+    email: "eleonardo@wustl.edu"
+repository-code: "https://github.com/leonardoestrella/wagner-noise-extension"
+license: MIT
+# TODO before release: add `version`, `date-released`, `doi` (Zenodo) and a
+# `preferred-citation` entry for the paper.

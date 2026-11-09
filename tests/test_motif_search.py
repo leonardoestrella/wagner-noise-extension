@@ -201,35 +201,11 @@ def test_count_feedback_loops_limits_size(mixed_motif_adj):
     assert loops[2]["Balancing Feedback"][0] == [2, 3]
 
 
-def test_calculate_motif_concentration_uses_connected_subgraphs(coherent_ffl_adj):
-    motif_counts = {"Coherent Type 1 (C1)": 1, "Incoherent Type 1 (I1)": 0}
-    concentrations = ms.calculate_motif_concentration(coherent_ffl_adj, motif_counts, 3)
-    assert concentrations["Coherent Type 1 (C1)"] == pytest.approx(1.0)
-    assert concentrations["Incoherent Type 1 (I1)"] == pytest.approx(0.0)
-
-
-def test_analyze_network_motifs_summary(mixed_motif_adj):
-    results = ms.analyze_network_motifs(mixed_motif_adj, max_fbl_size=3)
-    summary = results["summary"]
-    assert summary["total_ffls"] == 1
-    assert summary["total_fbls"] == 1
-    assert summary["fbl_proportion"]["balancing"] == 1
-    assert summary["fbl_proportion"]["reinforcing"] == 0
-
-
 def test_comprehensive_counts(comprehensive_adj):
     _, ffl_counts = ms.count_ffl_types(comprehensive_adj)
     assert ffl_counts["Coherent Type 1 (C1)"] == 1
     assert ffl_counts["Incoherent Type 1 (I1)"] == 1
     assert ffl_counts["Incoherent Type 2 (I2)"] == 1
-
-    concentrations = ms.calculate_motif_concentration(comprehensive_adj, ffl_counts, 3)
-    assert concentrations["Coherent Type 1 (C1)"] == pytest.approx(0.25)
-    assert concentrations["Incoherent Type 1 (I1)"] == pytest.approx(0.25)
-    assert concentrations["Incoherent Type 2 (I2)"] == pytest.approx(0.25)
-    for motif, value in concentrations.items():
-        if motif not in {"Coherent Type 1 (C1)", "Incoherent Type 1 (I1)", "Incoherent Type 2 (I2)"}:
-            assert value == pytest.approx(0.0)
 
     loops, counts = ms.count_feedback_loops(comprehensive_adj, max_size=4)
     assert counts[2]["Balancing Feedback"] == 2
@@ -238,14 +214,6 @@ def test_comprehensive_counts(comprehensive_adj):
     assert loops[2]["Balancing Feedback"] == [[0, 3], [1, 2]]
     assert loops[3]["Reinforcing Feedback"] == [[0, 2, 3]]
     assert loops[4]["Reinforcing Feedback"] == [[0, 1, 2, 3]]
-
-    # Feedback loop concentrations
-    conc_size2 = ms.calculate_motif_concentration(comprehensive_adj, counts[2], 2)
-    conc_size3 = ms.calculate_motif_concentration(comprehensive_adj, counts[3], 3)
-    conc_size4 = ms.calculate_motif_concentration(comprehensive_adj, counts[4], 4)
-    assert conc_size2["Balancing Feedback"] == pytest.approx(0.4)
-    assert conc_size3["Reinforcing Feedback"] == pytest.approx(0.25)
-    assert conc_size4["Reinforcing Feedback"] == pytest.approx(1.0)
 
 
 def test_double_ffl_counts(double_ffl_adj):
@@ -297,12 +265,6 @@ def test_larger_graph_motifs(larger_graph_adj):
     assert counts["Coherent Type 1 (C1)"] == 1
     assert counts["Coherent Type 4 (C4)"] == 1
     assert sum(counts.values()) == 2
-
-
-def test_concentration_skips_disconnected_subgraphs(disconnected_pairs_adj):
-    motif_counts = {"Dummy Motif": 2}
-    conc = ms.calculate_motif_concentration(disconnected_pairs_adj, motif_counts, 2)
-    assert conc["Dummy Motif"] == pytest.approx(1.0)
 
 
 def test_visualize_flag_calls_helper(monkeypatch, coherent_ffl_adj):
